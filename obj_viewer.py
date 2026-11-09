@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Загрузка, преобразование и сохранение многогранников Wavefront OBJ.
+
+Запуск из корня рабочего каталога:
+    python affine_transformations_projection/obj_viewer.py
+    python affine_transformations_projection/obj_viewer.py path/to/model.obj
+
+Используются geometry.py, transforms.py и интерфейс viewer.py. Зависимости —
+только стандартная библиотека Python, включая tkinter.
+Читаются вершины v и многоугольные грани f (v, v/vt, v//vn, v/vt/vn),
+положительные и отрицательные индексы. Текстуры, материалы, заданные нормали,
+линии и свободные поверхности не импортируются. При сохранении записываются
+геометрия v/f и текущие координаты после преобразований. Подбор вида меняет
+только камеру, координаты модели при этом остаются исходными.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+from geometry import Point, Polygon, Polyhedron, create_polyhedron
+from viewer import (
+    App, dot, mat_apply, mat_mul, newell_normal, projection_matrix,
+    save_obj, screen_matrix, view_matrix,
+)
+
+
+def _obj_lines(stream):
+    """Логические строки OBJ с учётом комментариев и продолжений через \\."""
+    pending = ""
+    start = 1
+    for number, raw in enumerate(stream, 1):
+        line = raw.partition("#")[0].strip()
+        if not pending:
+            start = number
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        yield start, pending + line
+        pending = ""
+    if pending:
+        raise ValueError(f"Строка {start}: незавершённое продолжение строки")
+
+
+def load_obj(path: str | Path) -> Polyhedron:
+    """Прочитать полигональную геометрию OBJ; ошибки содержат номер строки."""
+    path = Path(path)
+    vertices = []
+    face_indices = []
+    with path.open(encoding="utf-8-sig", errors="replace") as stream:
+        for number, line in _obj_lines(stream):
+            fields = line.split()
+            if not fields:
+                continue
+            kind, values = fields[0], fields[1:]
+            try:
+                if kind == "v":
+                    if len(values) < 3:
+                        raise ValueError("у вершины нужны координаты x, y, z")
+                    xyz = [float(value) for value in values[:3]]
+                    if len(values) == 4:
+                        weight = float(values[3])
+                        if not math.isfinite(weight) or weight == 0:
+                            raise ValueError("однородная координата w должна быть конечной и ненулевой")
+                        xyz = [value / weight for value in xyz]
+                    if not all(math.isfinite(value) for value in xyz):
+                        raise ValueError("координаты должны быть конечными числами")
+                    vertices.append(Point(*xyz))
+                elif kind == "f":
+                    if len(values) < 3:
+                        raise ValueError("грань должна содержать минимум три вершины")
+                    indices = []
+                    for value in values:
+                        index = int(value.split("/", 1)[0])
+                        if index == 0:
+                            raise ValueError("индексы OBJ начинаются с 1, индекс 0 недопустим")
+                        resolved = index - 1 if index > 0 else len(vertices) + index
+                        if index < 0 and not 0 <= resolved < len(vertices):
+                            raise ValueError(f"вершина {index} отсутствует")
+                        indices.append(resolved)
+                    face_indices.append((number, indices))
+            except (ValueError, OverflowError) as error:
+                raise ValueError(f"Строка {number}: {error}") from error
+
+    if not vertices or not face_indices:
+        raise ValueError("В OBJ должны быть вершины v и многоугольные грани f")
+    faces = []
+    for number, indices in face_indices:
+        if any(index >= len(vertices) for index in indices):
+            raise ValueError(f"Строка {number}: индекс вершины выходит за границы модели")
+        # Грани ссылаются на общие Point, поэтому transform() изменяет их вместе.
+        faces.append(Polygon([vertices[index] for index in indices]))
+    return Polyhedron(vertices, faces, name=path.stem)
+
+
+class OBJApp(App):
+    """Просмотрщик лабораторной №6 с файловыми операциями для OBJ."""
+
+    def __init__(self, root):
+        self.source_path = None
+        self.original = None
+        self.view_center = (0.0, 0.0, 0.0)
+        self.view_radius = 1.0
+        super().__init__(root)
+        root.title("Wavefront OBJ — загрузка, преобразования и сохранение")
+        self.original = self.poly.copy()
+        self.fit_view()
+
+    def _build_ui(self):
+        super()._build_ui()
+        def bind_reset(widget):
+            for child in widget.winfo_children():
+                if child.winfo_class() == "TButton" and child.cget("text") == "Сбросить фигуру":
+                    child.configure(command=self.restore_model)
+                bind_reset(child)
+        bind_reset(self.root)
+        menu = tk.Menu(self.root)
+        file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="Открыть OBJ…", accelerator="Ctrl+O", command=self.open_obj)
+        file_menu.add_command(label="Сохранить OBJ как…", accelerator="Ctrl+Shift+S", command=self.save_as)
+        file_menu.add_separator()
+        file_menu.add_command(label="Подобрать вид", accelerator="F", command=self.fit_view)
+        file_menu.add_command(label="Вернуть исходную модель", command=self.restore_model)
+        file_menu.add_separator()
+        file_menu.add_command(label="Выход", command=self.root.destroy)
+        menu.add_cascade(label="Файл", menu=file_menu)
+        self.root.config(menu=menu)
+        self.root.bind("<Control-o>", lambda event: self.open_obj())
+        self.root.bind("<Control-O>", lambda event: self.open_obj())
+        self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
+        # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
+        self.canvas.bind("<Key-f>", lambda event: self.fit_view())
+        self.canvas.bind("<Key-F>", lambda event: self.fit_view())
+
+    def _on_press(self, event):
+        self.canvas.focus_set()
+        super()._on_press(event)
+
+    def open_obj(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(
+                parent=self.root, title="Открыть модель Wavefront OBJ",
+                filetypes=[("Wavefront OBJ", "*.obj"), ("Все файлы", "*.*")],
+            )
+        if not path:
+            return
+        try:
+            poly = load_obj(path)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Ошибка загрузки OBJ", str(error), parent=self.root)
+            return
+        self.poly = poly
+        self.original = poly.copy()
+        self.source_path = Path(path)
+        self.fit_view()
+
+    def save_as(self):
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Сохранить текущую модель Wavefront OBJ",
+            defaultextension=".obj",
+            initialfile=(self.source_path.stem if self.source_path else self.poly_name.get()) + "_transformed.obj",
+            filetypes=[("Wavefront OBJ", "*.obj")],
+        )
+        if not path:
+            return
+        try:
+            save_obj(self.poly, path)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Ошибка сохранения OBJ", str(error), parent=self.root)
+            return
+        self.status.set(self.status.get() + f"\nСохранено: {path}")
+
+    def load_polyhedron(self):
+        # Выбор встроенной фигуры в списке начинает новую модель.
+        self.poly = create_polyhedron(self.poly_name.get())
+        self.original = self.poly.copy()
+        self.source_path = None
+        self.fit_view()
+
+    def restore_model(self):
+        if self.original is not None:
+            self.poly = self.original.copy()
+            self.fit_view()
+
+    @staticmethod
+    def _num(var, name="значение"):
+        value = App._num(var, name)
+        if not math.isfinite(value):
+            raise ValueError(f"Поле «{name}»: введите конечное число")
+        return value
+
+    def _apply(self, build_matrix):
+        # Проверяем результат на копии, чтобы ошибка не портила текущую модель.
+        try:
+            poly = self.poly.transformed(build_matrix())
+            if not all(math.isfinite(c) for p in poly.vertices for c in p.coords()):
+                raise ValueError("Результат преобразования выходит за диапазон чисел")
+        except (ValueError, OverflowError, ZeroDivisionError) as error:
+            messagebox.showerror("Ошибка преобразования", str(error), parent=self.root)
+            return
+        self.poly = poly
+        self.redraw()
+
+    def fit_view(self):
+        self.view_center = self.poly.center()
+        self.view_radius = max(self.poly.radius(), 1e-12)
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        if width < 10 or height < 10:
+            width = height = 600
+        self.zoom = min(width, height) * 0.3
+        self.redraw()
+
+    def redraw(self):
+        canvas = self.canvas
+        canvas.delete("all")
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if width < 10 or height < 10:
+            return
+        mode, dist = self.mode.get(), self.dist.get()
+        rotation = view_matrix(self.yaw, self.pitch)
+        projection = mat_mul(
+            screen_matrix(self.zoom, width / 2, height / 2),
+            projection_matrix(mode, dist),
+        )
+
+        def to_view(point):
+            normalized = tuple((point[i] - self.view_center[i]) / self.view_radius for i in range(3))
+            return mat_apply(rotation, normalized)[:3]
+
+        def to_screen(point):
+            x, y, z, w = mat_apply(projection, point)
+            if mode == "persp" and w * dist < 0.05:
+                return None
+            return x / w, y / w
+
+        if self.show_axes.get():
+            self._draw_axes(to_view, to_screen)
+        view = [to_view(point) for point in self.poly.vertex_array()]
+        light_length = math.sqrt(1.34)
+        light = (0.3 / light_length, 0.5 / light_length, 1 / light_length)
+        faces = []
+        for indices in self.poly.faces_as_indices():
+            points = [view[index] for index in indices]
+            screen = [to_screen(point) for point in points]
+            if any(point is None for point in screen):
+                continue
+            normal = newell_normal(points)
+            length = math.sqrt(dot(normal, normal))
+            # Двусторонние грани: применимо к невыпуклым, открытым моделям
+            # и отражениям. Не определяем нормаль по общему центру модели.
+            shade = 0.3 + 0.7 * abs(dot(normal, light)) / length if length > 1e-12 else 0.3
+            depth = sum(point[2] for point in points) / len(points)
+            faces.append((depth, screen, shade))
+        faces.sort(key=lambda face: face[0])
+        for _, screen, shade in faces:
+            color = "#%02x%02x%02x" % (int(70 * shade + 20), int(140 * shade + 30), int(225 * shade + 20))
+            canvas.create_polygon(
+                [coordinate for point in screen for coordinate in point],
+                fill=color if self.filled.get() else "", outline="#1b2a41", width=1,
+            )
+        source = str(self.source_path) if self.source_path else "Встроенная модель"
+        self.status.set(
+            f"{self.poly.name}: V={len(self.poly.vertices)}, F={len(self.poly.faces)}"
+            + "\nЦентр: (%.3g, %.3g, %.3g)" % self.poly.center()
+            + f"\n{source}\nЛКМ — камера; колесо — масштаб.\nФайл → Подобрать вид: показать всю модель."
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("model", nargs="?", help="путь к модели Wavefront OBJ")
+    args = parser.parse_args()
+    root = tk.Tk()
+    app = OBJApp(root)
+    if args.model:
+        root.after_idle(lambda: app.open_obj(args.model))
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -21,10 +21,26 @@ viewer.py — ЧАСТЬ 3: отображение, проекции и инте
 """
 
 import math
+from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
-from geometry import POLYHEDRA_KEYS, create_polyhedron
+from geometry import POLYHEDRA_KEYS, Polyhedron, create_polyhedron
+
+
+def save_obj(poly: Polyhedron, path: str | Path) -> None:
+    """Сохранить текущую геометрию без нормировки и триангуляции граней."""
+    if not poly.vertices or not poly.faces:
+        raise ValueError("Нельзя сохранить модель без вершин или граней")
+    if not all(math.isfinite(c) for point in poly.vertices for c in point.coords()):
+        raise ValueError("Координаты модели должны быть конечными числами")
+    indices = poly.faces_as_indices()
+    with Path(path).open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write("# Wavefront OBJ: polygon geometry\n")
+        for point in poly.vertices:
+            stream.write("v " + " ".join(format(c, ".17g") for c in point.coords()) + "\n")
+        for face in indices:
+            stream.write("f " + " ".join(str(index + 1) for index in face) + "\n")
 
 # ============================================================================
 #  АДАПТЕР к модулю человека 2
@@ -209,6 +225,9 @@ class App:
         ttk.Button(top, text="Сбросить фигуру", command=self.load_polyhedron).grid(
             row=4, column=1, sticky="we", pady=(4, 0)
         )
+        ttk.Button(top, text="Сохранить в OBJ…", command=self.save_as).grid(
+            row=5, column=0, columnspan=2, sticky="we", pady=(6, 0)
+        )
 
         # --- сдвиг
         self.v_move = self._section(
@@ -371,6 +390,24 @@ class App:
             )
 
         self._apply(build)
+
+    def save_as(self):
+        """Выбрать файл и сохранить модель с применёнными преобразованиями."""
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Сохранить текущую модель Wavefront OBJ",
+            defaultextension=".obj",
+            initialfile=self.poly.name + "_transformed.obj",
+            filetypes=[("Wavefront OBJ", "*.obj")],
+        )
+        if not path:
+            return
+        try:
+            save_obj(self.poly, path)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("Ошибка сохранения OBJ", str(error), parent=self.root)
+            return
+        self.status.set(self.status.get() + f"\nСохранено: {path}")
 
     # ---------------------------------------------------- состояние / камера
     def load_polyhedron(self):
