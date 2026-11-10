@@ -186,6 +186,7 @@ class App:
         # --- выбор многогранника и проекции
         top = ttk.LabelFrame(left, text="Многогранник и проекция", padding=6)
         top.pack(fill="x", pady=3)
+        self.top_panel = top  # для расширений (obj_viewer.py)
         cb = ttk.Combobox(
             top,
             textvariable=self.poly_name,

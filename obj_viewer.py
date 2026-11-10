@@ -21,9 +21,12 @@ import argparse
 import math
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 from geometry import Point, Polygon, Polyhedron, create_polyhedron
+from revolution import (
+    AXES, MAX_SEGMENTS, MIN_SEGMENTS, PRESETS, build_revolution, parse_generatrix,
+)
 from viewer import (
     App, dot, mat_apply, mat_mul, newell_normal, projection_matrix,
     save_obj, screen_matrix, view_matrix,
@@ -98,11 +101,112 @@ def load_obj(path: str | Path) -> Polyhedron:
     return Polyhedron(vertices, faces, name=path.stem)
 
 
+class RevolutionDialog:
+    """Окно задания образующей, оси и числа разбиений для фигуры вращения."""
+
+    HINT = (
+        "Одна точка в строке: x y z (z можно не писать).\n"
+        "Ось проходит через начало координат. Для оси Y точка (x, y)\n"
+        "означает: x — расстояние до оси, y — высота. Для оси X\n"
+        "радиус задаёт y, для оси Z — x. Точки на оси — полюса."
+    )
+
+    def __init__(self, app):
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("Фигура вращения")
+        self.window.transient(app.root)
+        frame = ttk.Frame(self.window, padding=8)
+        frame.pack(fill="both", expand=True)
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="Заготовка:").pack(side="left")
+        self.preset = tk.StringVar(value="Ваза")
+        box = ttk.Combobox(row, textvariable=self.preset, values=list(PRESETS),
+                           state="readonly", width=18)
+        box.pack(side="left", padx=6)
+        box.bind("<<ComboboxSelected>>", lambda event: self.load_preset())
+
+        ttk.Label(frame, text="Образующая (точки):").pack(anchor="w", pady=(8, 0))
+        self.text = tk.Text(frame, width=34, height=11, font=("Courier", 10))
+        self.text.pack(fill="both", expand=True)
+
+        opts = ttk.Frame(frame)
+        opts.pack(fill="x", pady=(8, 0))
+        ttk.Label(opts, text="Ось:").grid(row=0, column=0, sticky="w")
+        self.axis = tk.StringVar(value="y")
+        for i, axis in enumerate(AXES):
+            ttk.Radiobutton(opts, text=axis.upper(), value=axis,
+                            variable=self.axis).grid(row=0, column=1 + i)
+        ttk.Label(opts, text="Разбиений:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.segments = tk.StringVar(value="24")
+        self.segments.trace_add("write", lambda *args: self.update_angle())
+        ttk.Entry(opts, textvariable=self.segments, width=6).grid(
+            row=1, column=1, columnspan=2, sticky="w", pady=(6, 0))
+        self.angle_label = ttk.Label(opts, text="")
+        self.angle_label.grid(row=1, column=3, columnspan=3, sticky="w", pady=(6, 0))
+        self.closed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="Замкнуть образующую (последняя точка → первая)",
+                        variable=self.closed).grid(row=2, column=0, columnspan=6,
+                                                   sticky="w", pady=(6, 0))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Построить", command=self.build).pack(
+            side="left", expand=True, fill="x")
+        ttk.Button(buttons, text="Построить и сохранить в OBJ…",
+                   command=self.build_and_save).pack(side="left", expand=True,
+                                                     fill="x", padx=(6, 0))
+        ttk.Label(frame, text=self.HINT, foreground="#555", justify="left").pack(
+            anchor="w", pady=(8, 0))
+
+        self.load_preset()
+        self.update_angle()
+
+    def load_preset(self):
+        text, closed = PRESETS[self.preset.get()]
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", text)
+        self.axis.set("y")  # заготовки рассчитаны на ось Y
+        self.closed.set(closed)
+
+    def update_angle(self):
+        try:
+            n = int(self.segments.get())
+            self.angle_label.configure(text=f"угол шага = {360 / n:.4g}°")
+        except (ValueError, ZeroDivisionError):
+            self.angle_label.configure(text="")
+
+    def build(self):
+        """Построить модель и показать её в главном окне. Возвращает её или None."""
+        try:
+            segments = int(self.segments.get().strip())
+        except ValueError:
+            messagebox.showerror("Фигура вращения", "Число разбиений — целое число "
+                                 f"от {MIN_SEGMENTS} до {MAX_SEGMENTS}", parent=self.window)
+            return None
+        try:
+            poly = build_revolution(parse_generatrix(self.text.get("1.0", "end")),
+                                    self.axis.get(), segments, self.closed.get())
+        except ValueError as error:
+            messagebox.showerror("Фигура вращения", str(error), parent=self.window)
+            return None
+        self.app.show_model(poly, "Фигура вращения (построена в программе)")
+        return poly
+
+    def build_and_save(self):
+        if self.build() is not None:
+            self.app.save_as()
+
+
 class OBJApp(App):
     """Просмотрщик лабораторной №6 с файловыми операциями для OBJ."""
 
     def __init__(self, root):
         self.source_path = None
+        self.source_note = "Встроенная модель"
+        self.revolution_dialog = None
         self.original = None
         self.view_center = (0.0, 0.0, 0.0)
         self.view_radius = 1.0
@@ -124,6 +228,8 @@ class OBJApp(App):
         file_menu.add_command(label="Открыть OBJ…", accelerator="Ctrl+O", command=self.open_obj)
         file_menu.add_command(label="Сохранить OBJ как…", accelerator="Ctrl+Shift+S", command=self.save_as)
         file_menu.add_separator()
+        file_menu.add_command(label="Фигура вращения…", accelerator="Ctrl+R", command=self.open_revolution)
+        file_menu.add_separator()
         file_menu.add_command(label="Подобрать вид", accelerator="F", command=self.fit_view)
         file_menu.add_command(label="Вернуть исходную модель", command=self.restore_model)
         file_menu.add_separator()
@@ -131,6 +237,11 @@ class OBJApp(App):
         menu.add_cascade(label="Файл", menu=file_menu)
         self.root.config(menu=menu)
         self.root.bind("<Control-o>", lambda event: self.open_obj())
+        self.root.bind("<Control-r>", lambda event: self.open_revolution())
+        ttk.Button(self.top_panel, text="Открыть OBJ…", command=self.open_obj).grid(
+            row=6, column=0, sticky="we", pady=(4, 0))
+        ttk.Button(self.top_panel, text="Фигура вращения…", command=self.open_revolution).grid(
+            row=6, column=1, sticky="we", pady=(4, 0))
         self.root.bind("<Control-O>", lambda event: self.open_obj())
         self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
         # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
@@ -140,6 +251,20 @@ class OBJApp(App):
     def _on_press(self, event):
         self.canvas.focus_set()
         super()._on_press(event)
+
+    def show_model(self, poly, note):
+        """Показать новую модель (загруженную или построенную) как исходную."""
+        self.poly = poly
+        self.original = poly.copy()
+        self.source_path = None
+        self.source_note = note
+        self.fit_view()
+
+    def open_revolution(self):
+        if self.revolution_dialog is not None and self.revolution_dialog.window.winfo_exists():
+            self.revolution_dialog.window.lift()
+            return
+        self.revolution_dialog = RevolutionDialog(self)
 
     def open_obj(self, path=None):
         if path is None:
@@ -154,16 +279,14 @@ class OBJApp(App):
         except (OSError, ValueError) as error:
             messagebox.showerror("Ошибка загрузки OBJ", str(error), parent=self.root)
             return
-        self.poly = poly
-        self.original = poly.copy()
         self.source_path = Path(path)
-        self.fit_view()
+        self.show_model(poly, str(self.source_path))
 
     def save_as(self):
         path = filedialog.asksaveasfilename(
             parent=self.root, title="Сохранить текущую модель Wavefront OBJ",
             defaultextension=".obj",
-            initialfile=(self.source_path.stem if self.source_path else self.poly_name.get()) + "_transformed.obj",
+            initialfile=(self.source_path.stem if self.source_path else self.poly.name) + "_transformed.obj",
             filetypes=[("Wavefront OBJ", "*.obj")],
         )
         if not path:
@@ -180,6 +303,7 @@ class OBJApp(App):
         self.poly = create_polyhedron(self.poly_name.get())
         self.original = self.poly.copy()
         self.source_path = None
+        self.source_note = "Встроенная модель"
         self.fit_view()
 
     def restore_model(self):
@@ -264,7 +388,7 @@ class OBJApp(App):
                 [coordinate for point in screen for coordinate in point],
                 fill=color if self.filled.get() else "", outline="#1b2a41", width=1,
             )
-        source = str(self.source_path) if self.source_path else "Встроенная модель"
+        source = self.source_note
         self.status.set(
             f"{self.poly.name}: V={len(self.poly.vertices)}, F={len(self.poly.faces)}"
             + "\nЦентр: (%.3g, %.3g, %.3g)" % self.poly.center()
