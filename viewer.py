@@ -1,24 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-viewer.py — ЧАСТЬ 3: отображение, проекции и интерфейс.
-
-Запуск:  python viewer.py
-Нужны рядом: geometry.py (человек 1) и transforms.py (человек 2).
-Если transforms.py ещё нет — используются заглушки внутри этого файла (единичная матрица).
-
-Какие функции ожидаются от transforms.py (углы в градусах, матрицы 4x4):
-    translation(dx, dy, dz)
-    rotation_x(a), rotation_y(a), rotation_z(a)
-    scaling(sx, sy, sz)
-    reflection(plane)                         # 'XY' | 'XZ' | 'YZ'
-    scale_about_center(center, sx, sy, sz)    # center = poly.center()
-    rotate_about_center_axis(center, axis, a) # axis = 'x' | 'y' | 'z'
-    rotate_about_line(p1, p2, a)              # p1, p2 — кортежи (x, y, z)
-Если у человека 2 имена другие — поправьте блок «АДАПТЕР» ниже.
-
-Управление мышью: ЛКМ + движение — вращение камеры, колесо — масштаб.
-"""
 
 import math
 from pathlib import Path
@@ -42,9 +23,7 @@ def save_obj(poly: Polyhedron, path: str | Path) -> None:
         for face in indices:
             stream.write("f " + " ".join(str(index + 1) for index in face) + "\n")
 
-# ============================================================================
 #  АДАПТЕР к модулю человека 2
-# ============================================================================
 try:
     import transforms as _tr
 

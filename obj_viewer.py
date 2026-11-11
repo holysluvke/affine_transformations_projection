@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """Загрузка, преобразование и сохранение многогранников Wavefront OBJ.
 
-Запуск из корня рабочего каталога:
-    python affine_transformations_projection/obj_viewer.py
-    python affine_transformations_projection/obj_viewer.py path/to/model.obj
+Запуск:
+    python obj_viewer.py
+    python obj_viewer.py path/to/model.obj
 
 Используются geometry.py, transforms.py и интерфейс viewer.py. Зависимости —
 только стандартная библиотека Python, включая tkinter.
@@ -26,6 +26,10 @@ from tkinter import filedialog, messagebox, ttk
 from geometry import Point, Polygon, Polyhedron, create_polyhedron
 from revolution import (
     AXES, MAX_SEGMENTS, MIN_SEGMENTS, PRESETS, build_revolution, parse_generatrix,
+)
+from surface import (
+    MAX_SEGMENTS as SURF_MAX, MIN_SEGMENTS as SURF_MIN, PRESETS as SURF_PRESETS,
+    build_surface,
 )
 from viewer import (
     App, dot, mat_apply, mat_mul, newell_normal, projection_matrix,
@@ -200,6 +204,129 @@ class RevolutionDialog:
             self.app.save_as()
 
 
+class SurfaceDialog:
+    """Окно задания функции z = f(x, y), диапазонов и числа разбиений."""
+
+    HINT = (
+        "Формула от x и y: + - * / ** (или ^), скобки, константы pi, e,\n"
+        "функции sin, cos, tan, exp, log, sqrt, abs и др. из math.\n"
+        "Десятичный разделитель — точка. Где функция не определена,\n"
+        "в поверхности остаётся дыра."
+    )
+
+    def __init__(self, app):
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("График функции двух переменных")
+        self.window.transient(app.root)
+        frame = ttk.Frame(self.window, padding=8)
+        frame.pack(fill="both", expand=True)
+
+        row = ttk.Frame(frame)
+        row.pack(fill="x")
+        ttk.Label(row, text="Заготовка:").pack(side="left")
+        self.preset = tk.StringVar(value="Волна")
+        box = ttk.Combobox(row, textvariable=self.preset, values=list(SURF_PRESETS),
+                           state="readonly", width=20)
+        box.pack(side="left", padx=6)
+        box.bind("<<ComboboxSelected>>", lambda event: self.load_preset())
+
+        ttk.Label(frame, text="z = f(x, y) =").pack(anchor="w", pady=(8, 0))
+        self.formula = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.formula, width=40).pack(fill="x")
+
+        grid = ttk.Frame(frame)
+        grid.pack(fill="x", pady=(8, 0))
+        self.x0, self.x1 = tk.StringVar(), tk.StringVar()
+        self.y0, self.y1 = tk.StringVar(), tk.StringVar()
+        self.nx, self.ny = tk.StringVar(), tk.StringVar()
+        ttk.Label(grid, text="x от").grid(row=0, column=0, sticky="e")
+        ttk.Entry(grid, textvariable=self.x0, width=8).grid(row=0, column=1)
+        ttk.Label(grid, text="до").grid(row=0, column=2)
+        ttk.Entry(grid, textvariable=self.x1, width=8).grid(row=0, column=3)
+        ttk.Label(grid, text="y от").grid(row=1, column=0, sticky="e", pady=(4, 0))
+        self.y0_entry = ttk.Entry(grid, textvariable=self.y0, width=8)
+        self.y0_entry.grid(row=1, column=1, pady=(4, 0))
+        ttk.Label(grid, text="до").grid(row=1, column=2, pady=(4, 0))
+        self.y1_entry = ttk.Entry(grid, textvariable=self.y1, width=8)
+        self.y1_entry.grid(row=1, column=3, pady=(4, 0))
+        ttk.Label(grid, text="разбиений X").grid(row=2, column=0, sticky="e", pady=(4, 0))
+        ttk.Entry(grid, textvariable=self.nx, width=8).grid(row=2, column=1, pady=(4, 0))
+        ttk.Label(grid, text="Y").grid(row=2, column=2, pady=(4, 0))
+        self.ny_entry = ttk.Entry(grid, textvariable=self.ny, width=8)
+        self.ny_entry.grid(row=2, column=3, pady=(4, 0))
+
+        self.same = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame, text="Диапазон и разбиения по Y как по X",
+                        variable=self.same, command=self.sync).pack(anchor="w", pady=(6, 0))
+        for var in (self.x0, self.x1, self.nx):
+            var.trace_add("write", lambda *args: self.sync())
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Построить", command=self.build).pack(
+            side="left", expand=True, fill="x")
+        ttk.Button(buttons, text="Построить и сохранить в OBJ…",
+                   command=self.build_and_save).pack(side="left", expand=True,
+                                                     fill="x", padx=(6, 0))
+        ttk.Label(frame, text=self.HINT, foreground="#555", justify="left").pack(
+            anchor="w", pady=(8, 0))
+        self.load_preset()
+
+    def sync(self):
+        """При включённой галочке поля Y повторяют поля X и блокируются."""
+        if self.same.get():
+            self.y0.set(self.x0.get())
+            self.y1.set(self.x1.get())
+            self.ny.set(self.nx.get())
+        state = "disabled" if self.same.get() else "normal"
+        for entry in (self.y0_entry, self.y1_entry, self.ny_entry):
+            entry.configure(state=state)
+
+    def load_preset(self):
+        formula, x0, x1, y0, y1, n = SURF_PRESETS[self.preset.get()]
+        self.formula.set(formula)
+        for var, value in ((self.x0, x0), (self.x1, x1), (self.y0, y0),
+                           (self.y1, y1), (self.nx, n), (self.ny, n)):
+            var.set(str(value))
+        self.same.set(x0 == y0 and x1 == y1)
+        self.sync()
+
+    @staticmethod
+    def _number(var, name):
+        try:
+            return float(var.get().strip().replace(",", "."))
+        except ValueError:
+            raise ValueError(f"Поле «{name}»: введите число") from None
+
+    @staticmethod
+    def _integer(var, name):
+        try:
+            return int(var.get().strip())
+        except ValueError:
+            raise ValueError(f"Поле «{name}»: целое число от {SURF_MIN} до {SURF_MAX}") from None
+
+    def build(self):
+        """Построить поверхность и показать её в главном окне. Возвращает её или None."""
+        try:
+            poly = build_surface(
+                self.formula.get(),
+                (self._number(self.x0, "x от"), self._number(self.x1, "x до")),
+                (self._number(self.y0, "y от"), self._number(self.y1, "y до")),
+                self._integer(self.nx, "разбиений X"),
+                self._integer(self.ny, "разбиений Y"),
+            )
+        except (ValueError, OverflowError) as error:
+            messagebox.showerror("График функции", str(error), parent=self.window)
+            return None
+        self.app.show_model(poly, "График функции (построен в программе)")
+        return poly
+
+    def build_and_save(self):
+        if self.build() is not None:
+            self.app.save_as()
+
+
 class OBJApp(App):
     """Просмотрщик лабораторной №6 с файловыми операциями для OBJ."""
 
@@ -207,6 +334,7 @@ class OBJApp(App):
         self.source_path = None
         self.source_note = "Встроенная модель"
         self.revolution_dialog = None
+        self.surface_dialog = None
         self.original = None
         self.view_center = (0.0, 0.0, 0.0)
         self.view_radius = 1.0
@@ -229,6 +357,7 @@ class OBJApp(App):
         file_menu.add_command(label="Сохранить OBJ как…", accelerator="Ctrl+Shift+S", command=self.save_as)
         file_menu.add_separator()
         file_menu.add_command(label="Фигура вращения…", accelerator="Ctrl+R", command=self.open_revolution)
+        file_menu.add_command(label="График функции z=f(x,y)…", accelerator="Ctrl+G", command=self.open_surface)
         file_menu.add_separator()
         file_menu.add_command(label="Подобрать вид", accelerator="F", command=self.fit_view)
         file_menu.add_command(label="Вернуть исходную модель", command=self.restore_model)
@@ -238,10 +367,13 @@ class OBJApp(App):
         self.root.config(menu=menu)
         self.root.bind("<Control-o>", lambda event: self.open_obj())
         self.root.bind("<Control-r>", lambda event: self.open_revolution())
+        self.root.bind("<Control-g>", lambda event: self.open_surface())
         ttk.Button(self.top_panel, text="Открыть OBJ…", command=self.open_obj).grid(
             row=6, column=0, sticky="we", pady=(4, 0))
         ttk.Button(self.top_panel, text="Фигура вращения…", command=self.open_revolution).grid(
             row=6, column=1, sticky="we", pady=(4, 0))
+        ttk.Button(self.top_panel, text="График z=f(x,y)…", command=self.open_surface).grid(
+            row=7, column=0, columnspan=2, sticky="we", pady=(4, 0))
         self.root.bind("<Control-O>", lambda event: self.open_obj())
         self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
         # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
@@ -265,6 +397,12 @@ class OBJApp(App):
             self.revolution_dialog.window.lift()
             return
         self.revolution_dialog = RevolutionDialog(self)
+
+    def open_surface(self):
+        if self.surface_dialog is not None and self.surface_dialog.window.winfo_exists():
+            self.surface_dialog.window.lift()
+            return
+        self.surface_dialog = SurfaceDialog(self)
 
     def open_obj(self, path=None):
         if path is None:
