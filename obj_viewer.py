@@ -13,8 +13,9 @@
 линии и свободные поверхности не импортируются. При сохранении записываются
 геометрия v/f и текущие координаты после преобразований. Подбор вида меняет
 только камеру, координаты модели при этом остаются исходными.
-Невидимые поверхности удаляются общим программным Z-буфером. Демонстрация
-из трёх кубов позволяет преобразовывать каждый объект независимо.
+Нелицевые грани предварительно отсекаются по внешним нормалям и вектору
+обзора; оставшиеся поверхности обрабатываются общим программным Z-буфером.
+Демонстрация из трёх кубов позволяет преобразовывать каждый объект независимо.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from tkinter import filedialog, messagebox, ttk
 from geometry import Point, Polygon, Polyhedron, create_polyhedron
 import transforms
 from zbuffer import render_scene
+from backface_culling import classify_faces, filtered_model, visible_and_culled
 from revolution import (
     AXES, MAX_SEGMENTS, MIN_SEGMENTS, PRESETS, build_revolution, parse_generatrix,
 )
@@ -338,6 +340,11 @@ class OBJApp(App):
         self.models = []
         self.originals = []
         self.active_index = 0
+        self.view_azimuth = tk.DoubleVar(root, value=30.0)
+        self.view_elevation = tk.DoubleVar(root, value=20.0)
+        self.backface_enabled = tk.BooleanVar(root, value=True)
+        self.show_culled_faces = tk.BooleanVar(root, value=False)
+        self.show_face_normals = tk.BooleanVar(root, value=False)
         self._render_image = None
         self.source_path = None
         self.source_note = "Встроенная модель"
@@ -347,7 +354,7 @@ class OBJApp(App):
         self.view_center = (0.0, 0.0, 0.0)
         self.view_radius = 1.0
         super().__init__(root)
-        root.title("Wavefront OBJ — Z-буфер и преобразования")
+        root.title("Wavefront OBJ — отсечение граней, Z-буфер и преобразования")
         self.show_model(self.poly, "Встроенная модель")
 
     def _build_ui(self):
@@ -387,6 +394,31 @@ class OBJApp(App):
         self.object_box = ttk.Combobox(self.top_panel, state="readonly", width=22)
         self.object_box.grid(row=8, column=1, sticky="we", pady=(4, 0))
         self.object_box.bind("<<ComboboxSelected>>", self.select_object)
+
+        ttk.Label(self.top_panel, text="Вектор обзора · азимут (°)").grid(
+            row=9, column=0, sticky="w", pady=(7, 0))
+        ttk.Scale(
+            self.top_panel, from_=-180, to=180, variable=self.view_azimuth,
+            command=self._on_view_vector_change,
+        ).grid(row=9, column=1, sticky="we", pady=(7, 0))
+        ttk.Label(self.top_panel, text="Вектор обзора · наклон (°)").grid(
+            row=10, column=0, sticky="w")
+        ttk.Scale(
+            self.top_panel, from_=-89, to=89, variable=self.view_elevation,
+            command=self._on_view_vector_change,
+        ).grid(row=10, column=1, sticky="we")
+        ttk.Checkbutton(
+            self.top_panel, text="Отсечение нелицевых граней",
+            variable=self.backface_enabled, command=self.redraw,
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(
+            self.top_panel, text="Показать удалённые грани (красный пунктир)",
+            variable=self.show_culled_faces, command=self.redraw,
+        ).grid(row=12, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(
+            self.top_panel, text="Показать нормали лицевых граней",
+            variable=self.show_face_normals, command=self.redraw,
+        ).grid(row=13, column=0, columnspan=2, sticky="w")
         self.root.bind("<Control-O>", lambda event: self.open_obj())
         self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
         # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
@@ -396,6 +428,89 @@ class OBJApp(App):
     def _on_press(self, event):
         self.canvas.focus_set()
         super()._on_press(event)
+
+    def _sync_view_controls(self):
+        """Синхронизировать слайдеры с текущими углами камеры."""
+        azimuth = (math.degrees(self.yaw) + 180.0) % 360.0 - 180.0
+        self.yaw = math.radians(azimuth)
+        self.view_azimuth.set(azimuth)
+        self.view_elevation.set(math.degrees(self.pitch))
+
+    def _on_view_vector_change(self, _value=None):
+        """Изменить направление взгляда по двум углам камеры."""
+        self.yaw = math.radians(float(self.view_azimuth.get()))
+        self.pitch = math.radians(max(-89.0, min(89.0, float(self.view_elevation.get()))))
+        self.redraw()
+
+    def reset_view(self):
+        yaw, pitch = self.PRESETS[self.mode.get()]
+        self.yaw, self.pitch = math.radians(yaw), math.radians(pitch)
+        self._sync_view_controls()
+        self.redraw()
+
+    def _on_drag(self, event):
+        """Перетаскивание мышью по-прежнему вращает камеру и обновляет слайдеры."""
+        if self._drag is None:
+            return
+        dx, dy = event.x - self._drag[0], event.y - self._drag[1]
+        self._drag = (event.x, event.y)
+        self.yaw += dx * 0.01
+        limit = math.radians(89.0)
+        self.pitch = max(-limit, min(limit, self.pitch + dy * 0.01))
+        self._sync_view_controls()
+        self.redraw()
+
+    @staticmethod
+    def _clip_segment_to_near(a, b, distance):
+        """Обрезать отрезок в координатах камеры той же ближней плоскостью."""
+        limit = distance - 0.05
+        a_behind, b_behind = a[2] > limit, b[2] > limit
+        if a_behind and b_behind:
+            return None
+        if a_behind != b_behind:
+            t = (limit - a[2]) / (b[2] - a[2])
+            intersection = tuple(a[i] + t * (b[i] - a[i]) for i in range(3))
+            if a_behind:
+                a = intersection
+            else:
+                b = intersection
+        return a, b
+
+    def _draw_culled_faces(self, face_views, to_screen, mode, distance):
+        """Показать удалённые из рендера грани пунктирными красными рёбрами."""
+        for item in face_views:
+            if item.visible:
+                continue
+            points = item.points
+            for index, point_a in enumerate(points):
+                point_b = points[(index + 1) % len(points)]
+                if mode == "persp":
+                    clipped = self._clip_segment_to_near(point_a, point_b, distance)
+                    if clipped is None:
+                        continue
+                    point_a, point_b = clipped
+                screen_a, screen_b = to_screen(point_a), to_screen(point_b)
+                if screen_a is None or screen_b is None:
+                    continue
+                self.canvas.create_line(
+                    *screen_a, *screen_b, fill="#d62728", width=2,
+                    dash=(5, 3),
+                )
+
+    def _draw_face_normals(self, face_views, to_screen, view_radius):
+        """Нарисовать синие стрелки нормалей для оставленных граней выбранного объекта."""
+        length = max(0.035, 0.16 * self.poly.radius() / max(view_radius, 1e-12))
+        for item in face_views:
+            if not item.visible:
+                continue
+            tip = tuple(item.centroid[i] + item.normal[i] * length for i in range(3))
+            start_screen, end_screen = to_screen(item.centroid), to_screen(tip)
+            if start_screen is None or end_screen is None:
+                continue
+            self.canvas.create_line(
+                *start_screen, *end_screen, fill="#0877bd", width=2,
+                arrow=tk.LAST,
+            )
 
     def show_model(self, poly, note):
         """Показать новую модель (загруженную или построенную) как исходную."""
@@ -553,18 +668,62 @@ class OBJApp(App):
                 return None
             return x / w, y / w
 
-        buffer = render_scene(self.models or [self.poly], to_view, width, height,
+        scene_models = self.models or [self.poly]
+        render_models = []
+        face_views_by_model = []
+        counts = []
+        for model in scene_models:
+            face_views = classify_faces(model, to_view, mode, dist)
+            visible_indices, culled_indices = visible_and_culled(face_views)
+            face_views_by_model.append(face_views)
+            counts.append((len(visible_indices), len(culled_indices), len(model.faces)))
+            render_models.append(
+                filtered_model(model, visible_indices)
+                if self.backface_enabled.get() else model
+            )
+
+        # Важно: Z-буфер получает только отфильтрованные модели. Его реализация
+        # и проверка глубины остаются без изменений.
+        buffer = render_scene(render_models, to_view, width, height,
                               self.zoom, mode, dist, self.filled.get())
         self._render_image = tk.PhotoImage(master=self.root, data=buffer.ppm(), format="PPM")
         canvas.create_image(0, 0, anchor="nw", image=self._render_image)
         if self.show_axes.get():
             # Coordinate axes are an interface overlay, not scene geometry.
             self._draw_axes(to_view, to_screen)
+        if self.backface_enabled.get() and self.show_culled_faces.get():
+            for face_views in face_views_by_model:
+                self._draw_culled_faces(face_views, to_screen, mode, dist)
+            canvas.create_text(
+                width - 12, 14, anchor="ne",
+                text="Красный пунктир — отсечённые грани",
+                fill="#d62728", font=("Arial", 10, "bold"),
+            )
+        if self.show_face_normals.get():
+            # Стрелки показываются только для выбранного объекта, чтобы не
+            # перегружать сцену при демонстрации нескольких тел.
+            self._draw_face_normals(
+                face_views_by_model[self.active_index], to_screen, self.view_radius
+            )
         source = self.source_note
+        visible_total = sum(item[0] for item in counts)
+        culled_total = sum(item[1] for item in counts)
+        if self.backface_enabled.get():
+            culling_note = f"Отсечение: вкл. · оставлено {visible_total}, удалено {culled_total}"
+        else:
+            culling_note = f"Отсечение: выкл. · было бы удалено {culled_total}"
+        azimuth, elevation = math.radians(self.view_azimuth.get()), math.radians(self.view_elevation.get())
+        view_vector = (
+            math.sin(azimuth) * math.cos(elevation),
+            -math.sin(elevation),
+            -math.cos(azimuth) * math.cos(elevation),
+        )
         self.status.set(
             f"Z-буфер · Объектов: {len(self.models) or 1}\n"
             + f"Выбран: {self.poly.name}: V={len(self.poly.vertices)}, F={len(self.poly.faces)}"
             + "\nЦентр: (%.3g, %.3g, %.3g)" % self.poly.center()
+            + f"\n{culling_note}"
+            + "\nВектор обзора: (%.3f, %.3f, %.3f)" % view_vector
             + f"\n{source}\nЛКМ — камера; колесо — масштаб.\nФайл → Подобрать вид: показать всю модель."
         )
 
