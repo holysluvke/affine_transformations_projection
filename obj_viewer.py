@@ -13,6 +13,8 @@
 линии и свободные поверхности не импортируются. При сохранении записываются
 геометрия v/f и текущие координаты после преобразований. Подбор вида меняет
 только камеру, координаты модели при этом остаются исходными.
+Невидимые поверхности удаляются общим программным Z-буфером. Демонстрация
+из трёх кубов позволяет преобразовывать каждый объект независимо.
 """
 
 from __future__ import annotations
@@ -24,6 +26,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from geometry import Point, Polygon, Polyhedron, create_polyhedron
+import transforms
+from zbuffer import render_scene
 from revolution import (
     AXES, MAX_SEGMENTS, MIN_SEGMENTS, PRESETS, build_revolution, parse_generatrix,
 )
@@ -32,7 +36,7 @@ from surface import (
     build_surface,
 )
 from viewer import (
-    App, dot, mat_apply, mat_mul, newell_normal, projection_matrix,
+    App, mat_apply, mat_mul, projection_matrix,
     save_obj, screen_matrix, view_matrix,
 )
 
@@ -331,6 +335,10 @@ class OBJApp(App):
     """Просмотрщик лабораторной №6 с файловыми операциями для OBJ."""
 
     def __init__(self, root):
+        self.models = []
+        self.originals = []
+        self.active_index = 0
+        self._render_image = None
         self.source_path = None
         self.source_note = "Встроенная модель"
         self.revolution_dialog = None
@@ -339,9 +347,8 @@ class OBJApp(App):
         self.view_center = (0.0, 0.0, 0.0)
         self.view_radius = 1.0
         super().__init__(root)
-        root.title("Wavefront OBJ — загрузка, преобразования и сохранение")
-        self.original = self.poly.copy()
-        self.fit_view()
+        root.title("Wavefront OBJ — Z-буфер и преобразования")
+        self.show_model(self.poly, "Встроенная модель")
 
     def _build_ui(self):
         super()._build_ui()
@@ -358,6 +365,7 @@ class OBJApp(App):
         file_menu.add_separator()
         file_menu.add_command(label="Фигура вращения…", accelerator="Ctrl+R", command=self.open_revolution)
         file_menu.add_command(label="График функции z=f(x,y)…", accelerator="Ctrl+G", command=self.open_surface)
+        file_menu.add_command(label="Демонстрация Z-буфера: три куба", command=self.load_zbuffer_demo)
         file_menu.add_separator()
         file_menu.add_command(label="Подобрать вид", accelerator="F", command=self.fit_view)
         file_menu.add_command(label="Вернуть исходную модель", command=self.restore_model)
@@ -374,6 +382,11 @@ class OBJApp(App):
             row=6, column=1, sticky="we", pady=(4, 0))
         ttk.Button(self.top_panel, text="График z=f(x,y)…", command=self.open_surface).grid(
             row=7, column=0, columnspan=2, sticky="we", pady=(4, 0))
+        ttk.Button(self.top_panel, text="Z-буфер: три куба", command=self.load_zbuffer_demo).grid(
+            row=8, column=0, sticky="we", pady=(4, 0))
+        self.object_box = ttk.Combobox(self.top_panel, state="readonly", width=22)
+        self.object_box.grid(row=8, column=1, sticky="we", pady=(4, 0))
+        self.object_box.bind("<<ComboboxSelected>>", self.select_object)
         self.root.bind("<Control-O>", lambda event: self.open_obj())
         self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
         # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
@@ -388,8 +401,46 @@ class OBJApp(App):
         """Показать новую модель (загруженную или построенную) как исходную."""
         self.poly = poly
         self.original = poly.copy()
+        self.models = [poly]
+        self.originals = [self.original]
+        self.active_index = 0
+        self._update_object_box()
         self.source_path = None
         self.source_note = note
+        self.fit_view()
+
+    def _update_object_box(self):
+        self.object_box.configure(values=[f"{i + 1}: {p.name}" for i, p in enumerate(self.models)])
+        self.object_box.current(self.active_index)
+
+    def select_object(self, event=None):
+        """All existing transformation controls act on this object only."""
+        self.active_index = self.object_box.current()
+        self.poly = self.models[self.active_index]
+        self.original = self.originals[self.active_index]
+        self.redraw()
+
+    def load_zbuffer_demo(self):
+        """Intersecting convex objects require a shared per-pixel depth test."""
+        poses = [((-0.55, 0.15, 0.15), (15, 25, 10)),
+                 ((0.55, 0.15, -0.15), (-20, -30, -15)),
+                 ((0.0, -0.65, 0.3), (35, 10, 30))]
+        self.models = []
+        for i, (position, angles) in enumerate(poses):
+            poly = create_polyhedron("Гексаэдр (куб)", radius=1.25)
+            poly.name = ("Синий куб", "Оранжевый куб", "Зелёный куб")[i]
+            for rotate, angle in zip((transforms.rotation_x, transforms.rotation_y,
+                                      transforms.rotation_z), angles):
+                poly.transform(rotate(angle))
+            poly.transform(transforms.translation(*position))
+            self.models.append(poly)
+        self.originals = [p.copy() for p in self.models]
+        self.active_index = 0
+        self.poly, self.original = self.models[0], self.originals[0]
+        self.source_path = None
+        self.source_note = "Три пересекающихся куба. Преобразования — к выбранному объекту."
+        self.filled.set(True)
+        self._update_object_box()
         self.fit_view()
 
     def open_revolution(self):
@@ -417,8 +468,8 @@ class OBJApp(App):
         except (OSError, ValueError) as error:
             messagebox.showerror("Ошибка загрузки OBJ", str(error), parent=self.root)
             return
+        self.show_model(poly, str(Path(path)))
         self.source_path = Path(path)
-        self.show_model(poly, str(self.source_path))
 
     def save_as(self):
         path = filedialog.asksaveasfilename(
@@ -438,15 +489,12 @@ class OBJApp(App):
 
     def load_polyhedron(self):
         # Выбор встроенной фигуры в списке начинает новую модель.
-        self.poly = create_polyhedron(self.poly_name.get())
-        self.original = self.poly.copy()
-        self.source_path = None
-        self.source_note = "Встроенная модель"
-        self.fit_view()
+        self.show_model(create_polyhedron(self.poly_name.get()), "Встроенная модель")
 
     def restore_model(self):
         if self.original is not None:
             self.poly = self.original.copy()
+            self.models[self.active_index] = self.poly
             self.fit_view()
 
     @staticmethod
@@ -466,11 +514,15 @@ class OBJApp(App):
             messagebox.showerror("Ошибка преобразования", str(error), parent=self.root)
             return
         self.poly = poly
+        self.models[self.active_index] = poly
         self.redraw()
 
     def fit_view(self):
-        self.view_center = self.poly.center()
-        self.view_radius = max(self.poly.radius(), 1e-12)
+        vertices = [p.coords() for model in (self.models or [self.poly]) for p in model.vertices]
+        lo = [min(p[i] for p in vertices) for i in range(3)]
+        hi = [max(p[i] for p in vertices) for i in range(3)]
+        self.view_center = tuple((lo[i] + hi[i]) / 2 for i in range(3))
+        self.view_radius = max(max(math.dist(p, self.view_center) for p in vertices), 1e-12)
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
         if width < 10 or height < 10:
@@ -501,34 +553,17 @@ class OBJApp(App):
                 return None
             return x / w, y / w
 
+        buffer = render_scene(self.models or [self.poly], to_view, width, height,
+                              self.zoom, mode, dist, self.filled.get())
+        self._render_image = tk.PhotoImage(master=self.root, data=buffer.ppm(), format="PPM")
+        canvas.create_image(0, 0, anchor="nw", image=self._render_image)
         if self.show_axes.get():
+            # Coordinate axes are an interface overlay, not scene geometry.
             self._draw_axes(to_view, to_screen)
-        view = [to_view(point) for point in self.poly.vertex_array()]
-        light_length = math.sqrt(1.34)
-        light = (0.3 / light_length, 0.5 / light_length, 1 / light_length)
-        faces = []
-        for indices in self.poly.faces_as_indices():
-            points = [view[index] for index in indices]
-            screen = [to_screen(point) for point in points]
-            if any(point is None for point in screen):
-                continue
-            normal = newell_normal(points)
-            length = math.sqrt(dot(normal, normal))
-            # Двусторонние грани: применимо к невыпуклым, открытым моделям
-            # и отражениям. Не определяем нормаль по общему центру модели.
-            shade = 0.3 + 0.7 * abs(dot(normal, light)) / length if length > 1e-12 else 0.3
-            depth = sum(point[2] for point in points) / len(points)
-            faces.append((depth, screen, shade))
-        faces.sort(key=lambda face: face[0])
-        for _, screen, shade in faces:
-            color = "#%02x%02x%02x" % (int(70 * shade + 20), int(140 * shade + 30), int(225 * shade + 20))
-            canvas.create_polygon(
-                [coordinate for point in screen for coordinate in point],
-                fill=color if self.filled.get() else "", outline="#1b2a41", width=1,
-            )
         source = self.source_note
         self.status.set(
-            f"{self.poly.name}: V={len(self.poly.vertices)}, F={len(self.poly.faces)}"
+            f"Z-буфер · Объектов: {len(self.models) or 1}\n"
+            + f"Выбран: {self.poly.name}: V={len(self.poly.vertices)}, F={len(self.poly.faces)}"
             + "\nЦентр: (%.3g, %.3g, %.3g)" % self.poly.center()
             + f"\n{source}\nЛКМ — камера; колесо — масштаб.\nФайл → Подобрать вид: показать всю модель."
         )

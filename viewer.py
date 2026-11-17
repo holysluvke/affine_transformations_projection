@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from geometry import POLYHEDRA_KEYS, Polyhedron, create_polyhedron
+from zbuffer import render_scene
 
 
 def save_obj(poly: Polyhedron, path: str | Path) -> None:
@@ -149,8 +150,17 @@ class App:
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
-        left = ttk.Frame(self.root, padding=6)
-        left.pack(side="left", fill="y")
+        sidebar = ttk.Frame(self.root)
+        sidebar.pack(side="left", fill="y")
+        controls = tk.Canvas(sidebar, width=410, highlightthickness=0)
+        scroll = ttk.Scrollbar(sidebar, orient="vertical", command=controls.yview)
+        scroll.pack(side="right", fill="y")
+        controls.pack(side="left", fill="both", expand=True)
+        controls.configure(yscrollcommand=scroll.set)
+        left = ttk.Frame(controls, padding=6)
+        panel = controls.create_window(0, 0, window=left, anchor="nw")
+        left.bind("<Configure>", lambda e: controls.configure(scrollregion=controls.bbox("all")))
+        controls.bind("<Configure>", lambda e: controls.itemconfigure(panel, width=e.width))
         self.canvas = tk.Canvas(self.root, bg="white", highlightthickness=0)
         self.canvas.pack(side="right", fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda e: self.redraw())
@@ -444,63 +454,14 @@ class App:
                 return None
             return (x / w, y / w)
 
+        buffer = render_scene([self.poly], to_view, w, h, self.zoom, mode, dist,
+                              self.filled.get())
+        self._render_image = tk.PhotoImage(master=self.root, data=buffer.ppm(), format="PPM")
+        c.create_image(0, 0, anchor="nw", image=self._render_image)
         if self.show_axes.get():
             self._draw_axes(to_view, to_screen)
-
-        poly = self.poly
-        view = [to_view(p) for p in poly.vertex_array()]
-        center_v = to_view(poly.center())
-        cam = (0.0, 0.0, dist)
-        light = (0.3, 0.5, 1.0)
-        ln = math.sqrt(dot(light, light))
-        light = (light[0] / ln, light[1] / ln, light[2] / ln)
-
-        faces_draw = []
-        for idx in poly.faces_as_indices():
-            pts = [view[i] for i in idx]
-            n = newell_normal(pts)
-            nl = math.sqrt(dot(n, n))
-            if nl < 1e-12:
-                continue
-            n = (n[0] / nl, n[1] / nl, n[2] / nl)
-            fc = (
-                sum(p[0] for p in pts) / len(pts),
-                sum(p[1] for p in pts) / len(pts),
-                sum(p[2] for p in pts) / len(pts),
-            )
-            # нормаль наружу (на случай отражений, меняющих порядок обхода)
-            if (
-                dot(n, (fc[0] - center_v[0], fc[1] - center_v[1], fc[2] - center_v[2]))
-                < 0
-            ):
-                n = (-n[0], -n[1], -n[2])
-            to_cam = (
-                (0.0, 0.0, 1.0)
-                if mode == "axon"
-                else (cam[0] - fc[0], cam[1] - fc[1], cam[2] - fc[2])
-            )
-            if dot(n, to_cam) <= 0:  # нелицевая грань
-                continue
-            scr = [to_screen(p) for p in pts]
-            if any(s is None for s in scr):
-                continue
-            shade = 0.3 + 0.7 * max(0.0, dot(n, light))
-            faces_draw.append((fc[2], scr, shade))
-
-        faces_draw.sort(key=lambda t: t[0])  # от дальних к ближним
-        for _, scr, shade in faces_draw:
-            flat = [v for s in scr for v in s]
-            if self.filled.get():
-                col = "#%02x%02x%02x" % (
-                    int(70 * shade + 20),
-                    int(140 * shade + 30),
-                    int(225 * shade + 20),
-                )
-                c.create_polygon(flat, fill=col, outline="#1b2a41", width=1.5)
-            else:
-                c.create_polygon(flat, fill="", outline="#1b2a41", width=2)
-
-        self.status.set(poly.info() + "\nЦентр: (%.2f, %.2f, %.2f)" % poly.center())
+        self.status.set("Z-буфер\n" + self.poly.info()
+                        + "\nЦентр: (%.2f, %.2f, %.2f)" % self.poly.center())
 
     def _draw_axes(self, to_view, to_screen):
         L = 2.6
