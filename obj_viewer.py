@@ -25,11 +25,11 @@ import argparse
 import math
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from geometry import Point, Polygon, Polyhedron, create_polyhedron
 import transforms
-from zbuffer import render_scene
+from phong_toon import render_scene
 from backface_culling import classify_faces, filtered_model, visible_and_culled
 from revolution import (
     AXES, MAX_SEGMENTS, MIN_SEGMENTS, PRESETS, build_revolution, parse_generatrix,
@@ -385,6 +385,12 @@ class OBJApp(App):
         self.backface_enabled = tk.BooleanVar(root, value=True)
         self.show_culled_faces = tk.BooleanVar(root, value=False)
         self.show_face_normals = tk.BooleanVar(root, value=False)
+        self.shading = tk.StringVar(root, value="Плоский")
+        self.light_x = tk.DoubleVar(root, value=4.0)
+        self.light_y = tk.DoubleVar(root, value=6.0)
+        self.light_z = tk.DoubleVar(root, value=8.0)
+        self.object_color = (90, 170, 245)
+        self.object_color_hex = "#5aaaf5"
         self._render_image = None
         self.source_path = None
         self.source_note = "Встроенная модель"
@@ -459,11 +465,74 @@ class OBJApp(App):
             self.top_panel, text="Показать нормали лицевых граней",
             variable=self.show_face_normals, command=self.redraw,
         ).grid(row=13, column=0, columnspan=2, sticky="w")
+
+        ttk.Separator(self.top_panel, orient="horizontal").grid(
+            row=14, column=0, columnspan=2, sticky="we", pady=(8, 5)
+        )
+        ttk.Label(self.top_panel, text="Режим закраски").grid(
+            row=15, column=0, sticky="w"
+        )
+        shading_box = ttk.Combobox(
+            self.top_panel, textvariable=self.shading, state="readonly", width=18,
+            values=("Плоский", "Гуро", "Туншейдинг", "Текстура"),
+        )
+        shading_box.grid(row=15, column=1, sticky="we")
+        shading_box.bind("<<ComboboxSelected>>", lambda _event: self.redraw())
+
+        ttk.Label(self.top_panel, text="Цвет объекта").grid(
+            row=16, column=0, sticky="w", pady=(4, 0)
+        )
+        self.color_button = tk.Button(
+            self.top_panel, text=self.object_color_hex, bg=self.object_color_hex,
+            activebackground=self.object_color_hex, command=self._choose_object_color,
+            relief="raised", padx=8,
+        )
+        self.color_button.grid(row=16, column=1, sticky="we", pady=(4, 0))
+
+        ttk.Label(self.top_panel, text="Положение точечного света (мировые координаты)").grid(
+            row=17, column=0, columnspan=2, sticky="w", pady=(7, 0)
+        )
+        for row, axis, variable in (
+            (18, "X", self.light_x),
+            (19, "Y", self.light_y),
+            (20, "Z", self.light_z),
+        ):
+            ttk.Label(self.top_panel, text=axis).grid(row=row, column=0, sticky="w")
+            spin = ttk.Spinbox(
+                self.top_panel, from_=-100.0, to=100.0, increment=0.1,
+                textvariable=variable, width=9, command=self.redraw,
+            )
+            spin.grid(row=row, column=1, sticky="we")
+            spin.bind("<KeyRelease>", lambda _event: self.redraw())
+            spin.bind("<FocusOut>", lambda _event: self.redraw())
         self.root.bind("<Control-O>", lambda event: self.open_obj())
         self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
         # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
         self.canvas.bind("<Key-f>", lambda event: self.fit_view())
         self.canvas.bind("<Key-F>", lambda event: self.fit_view())
+
+    def _choose_object_color(self):
+        """Открыть системный выбор RGB-цвета и обновить сцену."""
+        selected = colorchooser.askcolor(
+            color=self.object_color_hex, title="Цвет объекта", parent=self.root
+        )
+        if selected[0] is None:
+            return
+        self.object_color = tuple(max(0, min(255, round(value))) for value in selected[0])
+        self.object_color_hex = selected[1]
+        self.color_button.configure(
+            text=self.object_color_hex, bg=self.object_color_hex,
+            activebackground=self.object_color_hex,
+        )
+        self.redraw()
+
+    def _render_shading_mode(self):
+        return {
+            "Плоский": "flat",
+            "Гуро": "gouraud",
+            "Туншейдинг": "toon",
+            "Текстура": "texture",
+        }.get(self.shading.get(), "flat")
 
     def _on_press(self, event):
         self.canvas.focus_set()
@@ -691,6 +760,13 @@ class OBJApp(App):
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width < 10 or height < 10:
             return
+        try:
+            light_position = (self.light_x.get(), self.light_y.get(), self.light_z.get())
+            if not all(math.isfinite(value) for value in light_position):
+                raise ValueError
+        except (tk.TclError, ValueError):
+            self.status.set("Некорректные координаты источника света: введите числа для X, Y и Z.")
+            return
         mode, dist = self.mode.get(), self.dist.get()
         rotation = view_matrix(self.yaw, self.pitch)
         projection = mat_mul(
@@ -722,10 +798,18 @@ class OBJApp(App):
                 if self.backface_enabled.get() else model
             )
 
-        # Важно: Z-буфер получает только отфильтрованные модели. Его реализация
-        # и проверка глубины остаются без изменений.
-        buffer = render_scene(render_models, to_view, width, height,
-                              self.zoom, mode, dist, self.filled.get())
+        # Z-буфер получает только отфильтрованные модели, но нормали для
+        # интерполяции сохранены по полной исходной сетке.
+        # Цвет применяется к выбранному объекту, остальные сохраняют палитру.
+        object_colors = [None] * len(render_models)
+        if 0 <= self.active_index < len(object_colors):
+            object_colors[self.active_index] = self.object_color
+        buffer = render_scene(
+            render_models, to_view, width, height, self.zoom, mode, dist,
+            self.filled.get(), shading=self._render_shading_mode(),
+            light_position=light_position,
+            object_colors=object_colors,
+        )
         self._render_image = tk.PhotoImage(master=self.root, data=buffer.ppm(), format="PPM")
         canvas.create_image(0, 0, anchor="nw", image=self._render_image)
         if self.show_axes.get():
@@ -763,6 +847,10 @@ class OBJApp(App):
             + f"Выбран: {self.poly.name}: V={len(self.poly.vertices)}, F={len(self.poly.faces)}"
             + "\nЦентр: (%.3g, %.3g, %.3g)" % self.poly.center()
             + f"\n{culling_note}"
+            + f"\nЗакраска: {self.shading.get()} · Цвет выбранного объекта: {self.object_color_hex}"
+            + "\nПоложение света: (%.2f, %.2f, %.2f)" % light_position
+            + ("\nТекстуры OBJ пока не поддерживаются: режим показывает базовый цвет."
+               if self._render_shading_mode() == "texture" else "")
             + "\nВектор обзора: (%.3f, %.3f, %.3f)" % view_vector
             + f"\n{source}\nЛКМ — камера; колесо — масштаб.\nФайл → Подобрать вид: показать всю модель."
         )
