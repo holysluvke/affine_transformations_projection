@@ -151,11 +151,31 @@ class Point:
 class Polygon:
     """Грань многогранника  замкнутая ломаная из точек (ссылки на Point)."""
 
-    def __init__(self, points: Sequence[Point]) -> None:
+    def __init__(self, points: Sequence[Point], corner_normals=None) -> None:  # 9 лаба
         pts = list(points)
         if len(pts) < 3:
             raise ValueError("В грани должно быть не меньше 3 точек")
         self.points: List[Point] = pts
+        # 9 лаба
+        # В OBJ индексы нормалей не зависят от индексов позиций. Общая вершина
+        # может иметь разные нормали на гранях по обе стороны резкого ребра.
+        if corner_normals is None:
+            self.corner_normals = [None] * len(pts)
+        else:
+            if len(corner_normals) != len(pts):
+                raise ValueError("Число нормалей должно совпадать с числом вершин грани")
+            self.corner_normals = []
+            for normal in corner_normals:
+                if normal is None:
+                    self.corner_normals.append(None)
+                    continue
+                normal = tuple(float(c) for c in normal)
+                if len(normal) != 3 or not all(math.isfinite(c) for c in normal):
+                    raise ValueError("Нормаль должна содержать три конечных числа")
+                length = math.hypot(*normal)
+                if length == 0:
+                    raise ValueError("Нормаль не может быть нулевой")
+                self.corner_normals.append(tuple(c / length for c in normal))
 
     # ---------- геометрия ---------------------------------------------------
     def centroid(self) -> Vec3:
@@ -186,7 +206,8 @@ class Polygon:
     # ---------- утилиты -----------------------------------------------------
     def copy(self) -> "Polygon":
         """Глубокая копия (с собственными точками)."""
-        return Polygon([p.copy() for p in self.points])
+        # 9 лаба
+        return Polygon([p.copy() for p in self.points], self.corner_normals)
 
     def __len__(self) -> int:
         return len(self.points)
@@ -213,6 +234,9 @@ class Polyhedron:
         self.vertices: List[Point] = list(vertices)
         self.faces: List[Polygon] = list(faces)
         self.name = name
+        # 9 лаба
+        self._vertex_normals = None
+        self._vertex_index = {id(p): i for i, p in enumerate(self.vertices)}
 
     # ---------- геометрия ---------------------------------------------------
     def center(self) -> Vec3:
@@ -257,6 +281,57 @@ class Polyhedron:
         """Единичные внешние нормали всех граней."""
         return [f.unit_normal() for f in self.faces]
 
+    # 9 лаба
+    def recalculate_vertex_normals(self) -> List[Vec3]:
+        """Усреднение нормалей смежных граней с весом по площади в мировых координатах.
+
+        Общий знак ориентации исправляет обратный обход замкнутой сетки
+        и отражения; для открытых поверхностей учитывается направление от центра.
+        Вырожденные и изолированные вершины получают нулевую нормаль:
+        для них остаётся только фоновое освещение. Загруженные нормали углов
+        граней по-прежнему доступны через face_vertex_normals.
+        """
+        sums = [[0.0, 0.0, 0.0] for _ in self.vertices]
+        if not self.vertices:
+            self._vertex_normals = []
+            return self._vertex_normals
+        index = {id(p): i for i, p in enumerate(self.vertices)}
+        center = self.center()
+        self._vertex_index = index
+        score = 0.0
+        total_area = 0.0
+        for face in self.faces:
+            normal = face.normal()  # Длина вектора Ньюэлла равна удвоенной площади.
+            total_area += math.hypot(*normal)
+            score += _v_dot(normal, _v_sub(face.centroid(), center))
+            for point_id in {id(p) for p in face.points}:
+                target = sums[index[point_id]]
+                for axis in range(3):
+                    target[axis] += normal[axis]
+        radius = max(math.dist(p.coords(), center) for p in self.vertices)
+        sign = -1.0 if score < -1e-12 * total_area * radius else 1.0
+        self._vertex_normals = []
+        for normal in sums:
+            length = math.hypot(*normal)
+            self._vertex_normals.append(
+                tuple(sign * c / length for c in normal) if length else (0.0, 0.0, 0.0))
+        return self._vertex_normals
+
+    # 9 лаба
+    def vertex_normals(self) -> List[Vec3]:
+        """Сглаженные нормали вершин; после преобразования пересчитываются при обращении."""
+        if self._vertex_normals is None:
+            return self.recalculate_vertex_normals()
+        return self._vertex_normals
+
+    # 9 лаба
+    def face_vertex_normals(self, face_index: int) -> List[Vec3]:
+        """Нормали углов грани: vn из OBJ имеют приоритет перед вычисленными нормалями."""
+        normals = self.vertex_normals()
+        face = self.faces[face_index]
+        return [explicit if explicit is not None else normals[self._vertex_index[id(point)]]
+                for point, explicit in zip(face.points, face.corner_normals)]
+
     def bounding_box(self) -> Tuple[Vec3, Vec3]:
         xs = [p.x for p in self.vertices]
         ys = [p.y for p in self.vertices]
@@ -268,6 +343,25 @@ class Polyhedron:
         """Применяет матрицу 4x4 ко ВСЕМ вершинам на месте. Возвращает self."""
         for p in self.vertices:
             p.apply_matrix(m)
+        # 9 лаба
+        self._vertex_normals = None
+        # При неравномерном масштабе загруженные нормали преобразуются через A^(-T).
+        a, b, c = (m[i][:3] for i in range(3))
+        cofactors = (_v_cross(b, c), _v_cross(c, a), _v_cross(a, b))
+        det = _v_dot(a, cofactors[0])
+        affine = all(abs(m[3][i]) < 1e-12 for i in range(3)) and abs(m[3][3] - 1) < 1e-12
+        for face in self.faces:
+            transformed = []
+            for normal in face.corner_normals:
+                if normal is None or not affine or det == 0:
+                    # У вырожденного преобразования нет обратной матрицы нормалей.
+                    # Используем нормали оставшейся геометрии вместо устаревших vn.
+                    transformed.append(None)
+                    continue
+                n = tuple(_v_dot(row, normal) / det for row in cofactors)
+                length = math.hypot(*n)
+                transformed.append(tuple(v / length for v in n) if length else None)
+            face.corner_normals = transformed
         return self
 
     def transformed(self, m: Matrix) -> "Polyhedron":
@@ -278,8 +372,13 @@ class Polyhedron:
         """Глубокая копия: новые точки, грани ссылаются на новые точки."""
         mapping: Dict[int, Point] = {id(p): Point(p.x, p.y, p.z) for p in self.vertices}
         new_vertices = [mapping[id(p)] for p in self.vertices]
-        new_faces = [Polygon([mapping[id(p)] for p in f.points]) for f in self.faces]
-        return Polyhedron(new_vertices, new_faces, self.name)
+        # 9 лаба
+        # Копия сохраняет нормали углов граней и уже вычисленные нормали вершин.
+        new_faces = [Polygon([mapping[id(p)] for p in f.points], f.corner_normals) for f in self.faces]
+        result = Polyhedron(new_vertices, new_faces, self.name)
+        if self._vertex_normals is not None:
+            result._vertex_normals = list(self._vertex_normals)
+        return result
 
     # ---------- служебное ---------------------------------------------------
     def euler_check(self) -> int:

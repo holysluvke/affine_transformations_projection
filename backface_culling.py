@@ -198,8 +198,12 @@ def visible_and_culled(face_views: Sequence[FaceView]) -> tuple[list[int], list[
 
 def filtered_model(model: Polyhedron, visible_indices: Sequence[int]) -> Polyhedron:
     """Создать оболочку модели только с лицевыми гранями, не копируя вершины."""
-    return Polyhedron(
+    result = Polyhedron(
         model.vertices,
         [model.faces[index] for index in visible_indices],
         name=model.name,
     )
+    # 9 лаба
+    # При сглаживании учитываются все смежные грани, в том числе отсечённые.
+    result._vertex_normals = list(model.vertex_normals())
+    return result

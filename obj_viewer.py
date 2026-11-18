@@ -9,8 +9,9 @@
 Используются geometry.py, transforms.py и интерфейс viewer.py. Зависимости —
 только стандартная библиотека Python, включая tkinter.
 Читаются вершины v и многоугольные грани f (v, v/vt, v//vn, v/vt/vn),
-положительные и отрицательные индексы. Текстуры, материалы, заданные нормали,
-линии и свободные поверхности не импортируются. При сохранении записываются
+положительные и отрицательные индексы. Нормали vn сохраняются отдельно для
+каждого угла грани; отсутствующие нормали вычисляются по смежным граням.
+Текстуры, материалы, линии и свободные поверхности не импортируются. При сохранении записываются
 геометрия v/f и текущие координаты после преобразований. Подбор вида меняет
 только камеру, координаты модели при этом остаются исходными.
 Нелицевые грани предварительно отсекаются по внешним нормалям и вектору
@@ -64,6 +65,9 @@ def load_obj(path: str | Path) -> Polyhedron:
     """Прочитать полигональную геометрию OBJ; ошибки содержат номер строки."""
     path = Path(path)
     vertices = []
+    # 9 лаба
+    # Нормали OBJ хранятся отдельно от координат вершин.
+    normals = []
     face_indices = []
     with path.open(encoding="utf-8-sig", errors="replace") as stream:
         for number, line in _obj_lines(stream):
@@ -84,30 +88,66 @@ def load_obj(path: str | Path) -> Polyhedron:
                     if not all(math.isfinite(value) for value in xyz):
                         raise ValueError("координаты должны быть конечными числами")
                     vertices.append(Point(*xyz))
+                # 9 лаба
+                # Читаем и нормализуем нормаль из записи vn.
+                elif kind == "vn":
+                    if len(values) != 3:
+                        raise ValueError("у нормали нужны три координаты")
+                    normal = tuple(float(value) for value in values)
+                    if not all(math.isfinite(c) for c in normal):
+                        raise ValueError("нормаль должна содержать конечные числа")
+                    length = math.hypot(*normal)
+                    if length == 0:
+                        raise ValueError("нормаль не может быть нулевой")
+                    normals.append(tuple(c / length for c in normal))
                 elif kind == "f":
                     if len(values) < 3:
                         raise ValueError("грань должна содержать минимум три вершины")
                     indices = []
+                    # 9 лаба
+                    normal_indices = []
                     for value in values:
-                        index = int(value.split("/", 1)[0])
+                        # 9 лаба
+                        # В ссылках v/vt/vn и v//vn нормаль задаётся третьим индексом.
+                        parts = value.split("/")
+                        if len(parts) > 3:
+                            raise ValueError(f"неверная ссылка вершины: {value}")
+                        index = int(parts[0])
                         if index == 0:
                             raise ValueError("индексы OBJ начинаются с 1, индекс 0 недопустим")
                         resolved = index - 1 if index > 0 else len(vertices) + index
                         if index < 0 and not 0 <= resolved < len(vertices):
                             raise ValueError(f"вершина {index} отсутствует")
                         indices.append(resolved)
-                    face_indices.append((number, indices))
+                        # 9 лаба
+                        # Отрицательный индекс отсчитывается от уже прочитанных vn.
+                        normal_index = None
+                        if len(parts) == 3 and parts[2]:
+                            raw = int(parts[2])
+                            if raw == 0:
+                                raise ValueError("индексы нормалей OBJ начинаются с 1")
+                            normal_index = raw - 1 if raw > 0 else len(normals) + raw
+                            if raw < 0 and not 0 <= normal_index < len(normals):
+                                raise ValueError(f"нормаль {raw} отсутствует")
+                        normal_indices.append(normal_index)
+                    # 9 лаба
+                    face_indices.append((number, indices, normal_indices))
             except (ValueError, OverflowError) as error:
                 raise ValueError(f"Строка {number}: {error}") from error
 
     if not vertices or not face_indices:
         raise ValueError("В OBJ должны быть вершины v и многоугольные грани f")
     faces = []
-    for number, indices in face_indices:
+    for number, indices, normal_indices in face_indices:  # 9 лаба
         if any(index >= len(vertices) for index in indices):
             raise ValueError(f"Строка {number}: индекс вершины выходит за границы модели")
         # Грани ссылаются на общие Point, поэтому transform() изменяет их вместе.
-        faces.append(Polygon([vertices[index] for index in indices]))
+        # 9 лаба
+        # Привязываем нормаль к углу грани, сохраняя общие позиции вершин.
+        if any(i is not None and i >= len(normals) for i in normal_indices):
+            raise ValueError(f"Строка {number}: индекс нормали выходит за границы модели")
+        faces.append(Polygon([vertices[index] for index in indices],
+                             [normals[i] if i is not None else None for i in normal_indices]))
     return Polyhedron(vertices, faces, name=path.stem)
 
 
@@ -529,14 +569,14 @@ class OBJApp(App):
         self.object_box.current(self.active_index)
 
     def select_object(self, event=None):
-        """All existing transformation controls act on this object only."""
+        """Все элементы управления преобразованиями действуют только на выбранный объект."""
         self.active_index = self.object_box.current()
         self.poly = self.models[self.active_index]
         self.original = self.originals[self.active_index]
         self.redraw()
 
     def load_zbuffer_demo(self):
-        """Intersecting convex objects require a shared per-pixel depth test."""
+        """Для пересекающихся выпуклых объектов нужна общая попиксельная проверка глубины."""
         poses = [((-0.55, 0.15, 0.15), (15, 25, 10)),
                  ((0.55, 0.15, -0.15), (-20, -30, -15)),
                  ((0.0, -0.65, 0.3), (35, 10, 30))]
@@ -689,7 +729,7 @@ class OBJApp(App):
         self._render_image = tk.PhotoImage(master=self.root, data=buffer.ppm(), format="PPM")
         canvas.create_image(0, 0, anchor="nw", image=self._render_image)
         if self.show_axes.get():
-            # Coordinate axes are an interface overlay, not scene geometry.
+            # Координатные оси — вспомогательная разметка поверх изображения сцены.
             self._draw_axes(to_view, to_screen)
         if self.backface_enabled.get() and self.show_culled_faces.get():
             for face_views in face_views_by_model:
