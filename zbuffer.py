@@ -8,6 +8,11 @@
 
 import math
 
+try:
+    import numpy as _np
+except ImportError:  # Pure-Python fallback remains fully supported.
+    _np = None
+
 
 
 def triangulate(points):
@@ -131,8 +136,14 @@ class ZBuffer:
 
     def __init__(self, width, height, background=(255, 255, 255)):
         self.width, self.height = width, height
-        self.depth = [math.inf] * (width * height)
-        self.owner = [-1] * (width * height)
+        if _np is not None:
+            # Плоские массивы позволяют Phong/toon обновлять строки Z-буфера
+            # векторно, без Python-цикла по каждому пикселю.
+            self.depth = _np.full(width * height, _np.inf, dtype=_np.float64)
+            self.owner = _np.full(width * height, -1, dtype=_np.int32)
+        else:
+            self.depth = [math.inf] * (width * height)
+            self.owner = [-1] * (width * height)
         self.rgb = bytearray(background) * (width * height)
 
     def triangle(self, a, b, c, color, owner=0):
@@ -156,18 +167,33 @@ class ZBuffer:
                 raise ValueError("Для перспективы нужны три положительных значения 1/w")
         self._triangle(p0, p1, p2, None, owner, colors, reciprocal_w)
 
+    def triangle_phong(
+        self, p0, p1, p2, n0, n1, n2, light_position,
+        object_color=(90, 170, 245), owner=0, *, positions=None,
+        reciprocal_w=None, view_position=None, ambient=0.15, diffuse=0.7,
+        specular=0.25, shininess=32.0,
+    ):
+        """Совместимый метод для непрерывного попиксельного освещения Фонга."""
+        from phong_toon import triangle_phong
+        triangle_phong(
+            self, p0, p1, p2, n0, n1, n2, light_position,
+            object_color=object_color, owner=owner, positions=positions,
+            reciprocal_w=reciprocal_w, view_position=view_position,
+            ambient=ambient, diffuse=diffuse, specular=specular,
+            shininess=shininess,
+        )
+
     def triangle_phong_toon(
         self, p0, p1, p2, n0, n1, n2, light_position,
         object_color=(90, 170, 245), owner=0, *, positions=None,
-        reciprocal_w=None, ambient=0.18, diffuse=0.82,
-        thresholds=(0.2, 0.45, 0.7),
+        reciprocal_w=None, ambient_bias=0.2, thresholds=(0.4, 0.7),
     ):
         """Совместимый метод; основной алгоритм хранится в ``phong_toon.py``."""
         from phong_toon import triangle_phong_toon
         triangle_phong_toon(
             self, p0, p1, p2, n0, n1, n2, light_position,
             object_color=object_color, owner=owner, positions=positions,
-            reciprocal_w=reciprocal_w, ambient=ambient, diffuse=diffuse,
+            reciprocal_w=reciprocal_w, ambient_bias=ambient_bias,
             thresholds=thresholds,
         )
 

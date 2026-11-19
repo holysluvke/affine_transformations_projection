@@ -392,6 +392,7 @@ class OBJApp(App):
         self.object_color = (90, 170, 245)
         self.object_color_hex = "#5aaaf5"
         self._render_image = None
+        self._redraw_after_id = None
         self.source_path = None
         self.source_note = "Встроенная модель"
         self.revolution_dialog = None
@@ -474,10 +475,10 @@ class OBJApp(App):
         )
         shading_box = ttk.Combobox(
             self.top_panel, textvariable=self.shading, state="readonly", width=18,
-            values=("Плоский", "Гуро", "Туншейдинг", "Текстура"),
+            values=("Плоский", "Гуро", "Фонг", "Туншейдинг", "Текстура"),
         )
         shading_box.grid(row=15, column=1, sticky="we")
-        shading_box.bind("<<ComboboxSelected>>", lambda _event: self.redraw())
+        shading_box.bind("<<ComboboxSelected>>", lambda _event: self.request_redraw())
 
         ttk.Label(self.top_panel, text="Цвет объекта").grid(
             row=16, column=0, sticky="w", pady=(4, 0)
@@ -503,8 +504,8 @@ class OBJApp(App):
                 textvariable=variable, width=9, command=self.redraw,
             )
             spin.grid(row=row, column=1, sticky="we")
-            spin.bind("<KeyRelease>", lambda _event: self.redraw())
-            spin.bind("<FocusOut>", lambda _event: self.redraw())
+            spin.bind("<KeyRelease>", lambda _event: self.request_redraw())
+            spin.bind("<FocusOut>", lambda _event: self.request_redraw())
         self.root.bind("<Control-O>", lambda event: self.open_obj())
         self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
         # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
@@ -530,6 +531,7 @@ class OBJApp(App):
         return {
             "Плоский": "flat",
             "Гуро": "gouraud",
+            "Фонг": "phong",
             "Туншейдинг": "toon",
             "Текстура": "texture",
         }.get(self.shading.get(), "flat")
@@ -549,7 +551,7 @@ class OBJApp(App):
         """Изменить направление взгляда по двум углам камеры."""
         self.yaw = math.radians(float(self.view_azimuth.get()))
         self.pitch = math.radians(max(-89.0, min(89.0, float(self.view_elevation.get()))))
-        self.redraw()
+        self.request_redraw()
 
     def reset_view(self):
         yaw, pitch = self.PRESETS[self.mode.get()]
@@ -567,7 +569,7 @@ class OBJApp(App):
         limit = math.radians(89.0)
         self.pitch = max(-limit, min(limit, self.pitch + dy * 0.01))
         self._sync_view_controls()
-        self.redraw()
+        self.request_redraw()
 
     @staticmethod
     def _clip_segment_to_near(a, b, distance):
@@ -754,7 +756,23 @@ class OBJApp(App):
         self.zoom = min(width, height) * 0.3
         self.redraw()
 
+    def request_redraw(self, delay_ms=20):
+        """Объединить частые события мыши/слайдеров в один кадр рендеринга."""
+        if self._redraw_after_id is None:
+            self._redraw_after_id = self.root.after(delay_ms, self._run_scheduled_redraw)
+
+    def _run_scheduled_redraw(self):
+        self._redraw_after_id = None
+        self.redraw()
+
     def redraw(self):
+        # Прямой redraw отменяет устаревший отложенный кадр.
+        if self._redraw_after_id is not None:
+            try:
+                self.root.after_cancel(self._redraw_after_id)
+            except tk.TclError:
+                pass
+            self._redraw_after_id = None
         canvas = self.canvas
         canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
