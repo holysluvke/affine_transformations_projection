@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 
 from backface_culling import classify_faces
 from zbuffer import PALETTE, ZBuffer, triangulate
+# 9 лаба
+from lighting import DEFAULT_LIGHT_POSITION, lambert_color
 
 MAX_ELEVATION = 89.0
 
@@ -156,6 +158,37 @@ def clip_polygon(polygon):
     return result
 
 
+# 9 лаба
+def clip_polygon_varyings(polygon, varyings):
+    """Обрезать позиции и атрибуты вершин с одинаковым параметром вдоль ребра.
+
+    Атрибуты — произвольные кортежи, для Гуро это компоненты RGB. Они
+    интерполируются до деления на w; затем растеризатор учитывает 1/w.
+    """
+    if len(polygon) != len(varyings):
+        raise ValueError("Каждой clip-вершине должен соответствовать набор атрибутов")
+    if varyings and any(len(values) != len(varyings[0]) for values in varyings):
+        raise ValueError("Число атрибутов должно совпадать у всех вершин")
+    result = list(zip(polygon, varyings))
+    for plane in _CLIP_PLANES:
+        if not result:
+            break
+        clipped = []
+        previous, previous_values = result[-1]
+        previous_d = plane(previous)
+        for current, current_values in result:
+            current_d = plane(current)
+            if (previous_d >= 0.0) != (current_d >= 0.0):
+                t = previous_d / (previous_d - current_d)
+                values = tuple(a + t * (b - a) for a, b in zip(previous_values, current_values))
+                clipped.append((_lerp4(previous, current, t), values))
+            if current_d >= 0.0:
+                clipped.append((current, current_values))
+            previous, previous_values, previous_d = current, current_values, current_d
+        result = clipped
+    return [p for p, _ in result], [v for _, v in result]
+
+
 def _viewport(c, width, height):
     """clip -> пиксели: делим на w, растягиваем NDC [-1,1] на окно, переворачиваем Y"""
     w = c[3]
@@ -175,8 +208,23 @@ class RenderResult:
     face_views: list = field(default_factory=list)
 
 
-def render_camera(models, camera, width, height, filled=True, backface=True):
-    """Нарисовать сцену глазами камеры. Возвращает RenderResult"""
+# 9 лаба
+def render_camera(models, camera, width, height, filled=True, backface=True, *,
+                  shading="gouraud", light_position=DEFAULT_LIGHT_POSITION,
+                  object_color=None, ambient=0.15, diffuse=0.85, draw_edges=None):
+    """Вернуть RenderResult с плоской закраской или шейдингом Гуро по Ламберту.
+
+    Именованные параметры предназначены для подключения интерфейса участником 2.
+    Гуро включён по умолчанию; его можно показать без новых элементов управления.
+    Положение света задаётся в мировых координатах, цвет — компонентами RGB.
+    При object_color=None сохраняется палитра объектов. В режиме заливки Гуро
+    рёбра по умолчанию скрыты, чтобы были видны плавные переходы цвета.
+    """
+    # 9 лаба
+    if shading not in ("flat", "gouraud"):
+        raise ValueError("Поддерживаются режимы flat и gouraud")
+    if draw_edges is None:
+        draw_edges = not filled or shading == "flat"
     buffer = ZBuffer(width, height)
     view = camera.view_matrix()  # один раз на кадр
     projection = camera.projection_matrix(width / height)
@@ -192,7 +240,8 @@ def render_camera(models, camera, width, height, filled=True, backface=True):
     owner = 0  # уникальный номер грани
 
     for object_index, model in enumerate(models):
-        base = PALETTE[object_index % len(PALETTE)]  # свой цвет у каждой модели
+        # 9 лаба
+        base = object_color if object_color is not None else PALETTE[object_index % len(PALETTE)]
         face_views = classify_faces(model, to_view, "persp", 0.0)
         result.face_views.append(face_views)
 
@@ -208,16 +257,40 @@ def render_camera(models, camera, width, height, filled=True, backface=True):
             shade = 0.3 + 0.7 * abs(_dot(face.normal, light))  # 0.3 — «фоновый» свет
             color = (tuple(min(255, int(v * shade)) for v in base)
                      if filled else (255, 255, 255))
+            # 9 лаба
+            # Цвет каждой вершины вычисляется по Ламберту в мировых координатах.
+            vertex_colors = None
+            if filled and shading == "gouraud":
+                world_face = model.faces[face.index]
+                normals = model.face_vertex_normals(face.index)
+                vertex_colors = [lambert_color(p.coords(), n, light_position, base, ambient, diffuse)
+                                 for p, n in zip(world_face.points, normals)]
 
             for triangle in triangulate(points):
-                clip = clip_polygon([_apply(projection, points[i]) for i in triangle])
+                # 9 лаба
+                # При обрезании треугольника переносим цвета в новые вершины.
+                projected = [_apply(projection, points[i]) for i in triangle]
+                if vertex_colors is not None:
+                    clip, colors = clip_polygon_varyings(projected, [vertex_colors[i] for i in triangle])
+                else:
+                    clip = clip_polygon(projected)
                 if len(clip) < 3:
                     continue  # треугольник целиком вне
                 screen = [_viewport(c, width, height) for c in clip]
                 for i in range(1, len(screen) - 1):  # веер треугольников
-                    buffer.triangle(screen[0], screen[i], screen[i + 1], color, owner)
+                    # 9 лаба
+                    # Передаём 1/w для интерполяции цвета с поправкой на перспективу.
+                    if vertex_colors is not None:
+                        buffer.triangle_gouraud(
+                            screen[0], screen[i], screen[i + 1],
+                            colors[0], colors[i], colors[i + 1], owner,
+                            reciprocal_w=(1 / clip[0][3], 1 / clip[i][3], 1 / clip[i + 1][3]))
+                    else:
+                        buffer.triangle(screen[0], screen[i], screen[i + 1], color, owner)
 
-            for a, b in zip(points, points[1:] + points[:1]):  # рёбра грани
+            # 9 лаба
+            # Видимость рёбер задаётся параметром draw_edges.
+            for a, b in zip(points, points[1:] + points[:1]) if draw_edges else ():
                 segment = clip_segment(_apply(projection, a), _apply(projection, b))
                 if segment is not None:
                     edges.append((_viewport(segment[0], width, height),

@@ -9,8 +9,9 @@
 Используются geometry.py, transforms.py и интерфейс viewer.py. Зависимости —
 только стандартная библиотека Python, включая tkinter.
 Читаются вершины v и многоугольные грани f (v, v/vt, v//vn, v/vt/vn),
-положительные и отрицательные индексы. Текстуры, материалы, заданные нормали,
-линии и свободные поверхности не импортируются. При сохранении записываются
+положительные и отрицательные индексы. Нормали vn сохраняются отдельно для
+каждого угла грани; отсутствующие нормали вычисляются по смежным граням.
+Текстуры, материалы, линии и свободные поверхности не импортируются. При сохранении записываются
 геометрия v/f и текущие координаты после преобразований. Подбор вида меняет
 только камеру, координаты модели при этом остаются исходными.
 Нелицевые грани предварительно отсекаются по внешним нормалям и вектору
@@ -24,11 +25,11 @@ import argparse
 import math
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, ttk
 
 from geometry import Point, Polygon, Polyhedron, create_polyhedron
 import transforms
-from zbuffer import render_scene
+from phong_toon import render_scene
 from backface_culling import classify_faces, filtered_model, visible_and_culled
 from revolution import (
     AXES, MAX_SEGMENTS, MIN_SEGMENTS, PRESETS, build_revolution, parse_generatrix,
@@ -64,6 +65,9 @@ def load_obj(path: str | Path) -> Polyhedron:
     """Прочитать полигональную геометрию OBJ; ошибки содержат номер строки."""
     path = Path(path)
     vertices = []
+    # 9 лаба
+    # Нормали OBJ хранятся отдельно от координат вершин.
+    normals = []
     face_indices = []
     with path.open(encoding="utf-8-sig", errors="replace") as stream:
         for number, line in _obj_lines(stream):
@@ -84,30 +88,66 @@ def load_obj(path: str | Path) -> Polyhedron:
                     if not all(math.isfinite(value) for value in xyz):
                         raise ValueError("координаты должны быть конечными числами")
                     vertices.append(Point(*xyz))
+                # 9 лаба
+                # Читаем и нормализуем нормаль из записи vn.
+                elif kind == "vn":
+                    if len(values) != 3:
+                        raise ValueError("у нормали нужны три координаты")
+                    normal = tuple(float(value) for value in values)
+                    if not all(math.isfinite(c) for c in normal):
+                        raise ValueError("нормаль должна содержать конечные числа")
+                    length = math.hypot(*normal)
+                    if length == 0:
+                        raise ValueError("нормаль не может быть нулевой")
+                    normals.append(tuple(c / length for c in normal))
                 elif kind == "f":
                     if len(values) < 3:
                         raise ValueError("грань должна содержать минимум три вершины")
                     indices = []
+                    # 9 лаба
+                    normal_indices = []
                     for value in values:
-                        index = int(value.split("/", 1)[0])
+                        # 9 лаба
+                        # В ссылках v/vt/vn и v//vn нормаль задаётся третьим индексом.
+                        parts = value.split("/")
+                        if len(parts) > 3:
+                            raise ValueError(f"неверная ссылка вершины: {value}")
+                        index = int(parts[0])
                         if index == 0:
                             raise ValueError("индексы OBJ начинаются с 1, индекс 0 недопустим")
                         resolved = index - 1 if index > 0 else len(vertices) + index
                         if index < 0 and not 0 <= resolved < len(vertices):
                             raise ValueError(f"вершина {index} отсутствует")
                         indices.append(resolved)
-                    face_indices.append((number, indices))
+                        # 9 лаба
+                        # Отрицательный индекс отсчитывается от уже прочитанных vn.
+                        normal_index = None
+                        if len(parts) == 3 and parts[2]:
+                            raw = int(parts[2])
+                            if raw == 0:
+                                raise ValueError("индексы нормалей OBJ начинаются с 1")
+                            normal_index = raw - 1 if raw > 0 else len(normals) + raw
+                            if raw < 0 and not 0 <= normal_index < len(normals):
+                                raise ValueError(f"нормаль {raw} отсутствует")
+                        normal_indices.append(normal_index)
+                    # 9 лаба
+                    face_indices.append((number, indices, normal_indices))
             except (ValueError, OverflowError) as error:
                 raise ValueError(f"Строка {number}: {error}") from error
 
     if not vertices or not face_indices:
         raise ValueError("В OBJ должны быть вершины v и многоугольные грани f")
     faces = []
-    for number, indices in face_indices:
+    for number, indices, normal_indices in face_indices:  # 9 лаба
         if any(index >= len(vertices) for index in indices):
             raise ValueError(f"Строка {number}: индекс вершины выходит за границы модели")
         # Грани ссылаются на общие Point, поэтому transform() изменяет их вместе.
-        faces.append(Polygon([vertices[index] for index in indices]))
+        # 9 лаба
+        # Привязываем нормаль к углу грани, сохраняя общие позиции вершин.
+        if any(i is not None and i >= len(normals) for i in normal_indices):
+            raise ValueError(f"Строка {number}: индекс нормали выходит за границы модели")
+        faces.append(Polygon([vertices[index] for index in indices],
+                             [normals[i] if i is not None else None for i in normal_indices]))
     return Polyhedron(vertices, faces, name=path.stem)
 
 
@@ -345,7 +385,14 @@ class OBJApp(App):
         self.backface_enabled = tk.BooleanVar(root, value=True)
         self.show_culled_faces = tk.BooleanVar(root, value=False)
         self.show_face_normals = tk.BooleanVar(root, value=False)
+        self.shading = tk.StringVar(root, value="Плоский")
+        self.light_x = tk.DoubleVar(root, value=4.0)
+        self.light_y = tk.DoubleVar(root, value=6.0)
+        self.light_z = tk.DoubleVar(root, value=8.0)
+        self.object_color = (90, 170, 245)
+        self.object_color_hex = "#5aaaf5"
         self._render_image = None
+        self._redraw_after_id = None
         self.source_path = None
         self.source_note = "Встроенная модель"
         self.revolution_dialog = None
@@ -419,11 +466,75 @@ class OBJApp(App):
             self.top_panel, text="Показать нормали лицевых граней",
             variable=self.show_face_normals, command=self.redraw,
         ).grid(row=13, column=0, columnspan=2, sticky="w")
+
+        ttk.Separator(self.top_panel, orient="horizontal").grid(
+            row=14, column=0, columnspan=2, sticky="we", pady=(8, 5)
+        )
+        ttk.Label(self.top_panel, text="Режим закраски").grid(
+            row=15, column=0, sticky="w"
+        )
+        shading_box = ttk.Combobox(
+            self.top_panel, textvariable=self.shading, state="readonly", width=18,
+            values=("Плоский", "Гуро", "Фонг", "Туншейдинг", "Текстура"),
+        )
+        shading_box.grid(row=15, column=1, sticky="we")
+        shading_box.bind("<<ComboboxSelected>>", lambda _event: self.request_redraw())
+
+        ttk.Label(self.top_panel, text="Цвет объекта").grid(
+            row=16, column=0, sticky="w", pady=(4, 0)
+        )
+        self.color_button = tk.Button(
+            self.top_panel, text=self.object_color_hex, bg=self.object_color_hex,
+            activebackground=self.object_color_hex, command=self._choose_object_color,
+            relief="raised", padx=8,
+        )
+        self.color_button.grid(row=16, column=1, sticky="we", pady=(4, 0))
+
+        ttk.Label(self.top_panel, text="Положение точечного света (мировые координаты)").grid(
+            row=17, column=0, columnspan=2, sticky="w", pady=(7, 0)
+        )
+        for row, axis, variable in (
+            (18, "X", self.light_x),
+            (19, "Y", self.light_y),
+            (20, "Z", self.light_z),
+        ):
+            ttk.Label(self.top_panel, text=axis).grid(row=row, column=0, sticky="w")
+            spin = ttk.Spinbox(
+                self.top_panel, from_=-100.0, to=100.0, increment=0.1,
+                textvariable=variable, width=9, command=self.redraw,
+            )
+            spin.grid(row=row, column=1, sticky="we")
+            spin.bind("<KeyRelease>", lambda _event: self.request_redraw())
+            spin.bind("<FocusOut>", lambda _event: self.request_redraw())
         self.root.bind("<Control-O>", lambda event: self.open_obj())
         self.root.bind("<Control-Shift-S>", lambda event: self.save_as())
         # Клавиша работает на холсте и не перехватывает ввод в полях параметров.
         self.canvas.bind("<Key-f>", lambda event: self.fit_view())
         self.canvas.bind("<Key-F>", lambda event: self.fit_view())
+
+    def _choose_object_color(self):
+        """Открыть системный выбор RGB-цвета и обновить сцену."""
+        selected = colorchooser.askcolor(
+            color=self.object_color_hex, title="Цвет объекта", parent=self.root
+        )
+        if selected[0] is None:
+            return
+        self.object_color = tuple(max(0, min(255, round(value))) for value in selected[0])
+        self.object_color_hex = selected[1]
+        self.color_button.configure(
+            text=self.object_color_hex, bg=self.object_color_hex,
+            activebackground=self.object_color_hex,
+        )
+        self.redraw()
+
+    def _render_shading_mode(self):
+        return {
+            "Плоский": "flat",
+            "Гуро": "gouraud",
+            "Фонг": "phong",
+            "Туншейдинг": "toon",
+            "Текстура": "texture",
+        }.get(self.shading.get(), "flat")
 
     def _on_press(self, event):
         self.canvas.focus_set()
@@ -440,7 +551,7 @@ class OBJApp(App):
         """Изменить направление взгляда по двум углам камеры."""
         self.yaw = math.radians(float(self.view_azimuth.get()))
         self.pitch = math.radians(max(-89.0, min(89.0, float(self.view_elevation.get()))))
-        self.redraw()
+        self.request_redraw()
 
     def reset_view(self):
         yaw, pitch = self.PRESETS[self.mode.get()]
@@ -458,7 +569,7 @@ class OBJApp(App):
         limit = math.radians(89.0)
         self.pitch = max(-limit, min(limit, self.pitch + dy * 0.01))
         self._sync_view_controls()
-        self.redraw()
+        self.request_redraw()
 
     @staticmethod
     def _clip_segment_to_near(a, b, distance):
@@ -529,14 +640,14 @@ class OBJApp(App):
         self.object_box.current(self.active_index)
 
     def select_object(self, event=None):
-        """All existing transformation controls act on this object only."""
+        """Все элементы управления преобразованиями действуют только на выбранный объект."""
         self.active_index = self.object_box.current()
         self.poly = self.models[self.active_index]
         self.original = self.originals[self.active_index]
         self.redraw()
 
     def load_zbuffer_demo(self):
-        """Intersecting convex objects require a shared per-pixel depth test."""
+        """Для пересекающихся выпуклых объектов нужна общая попиксельная проверка глубины."""
         poses = [((-0.55, 0.15, 0.15), (15, 25, 10)),
                  ((0.55, 0.15, -0.15), (-20, -30, -15)),
                  ((0.0, -0.65, 0.3), (35, 10, 30))]
@@ -645,11 +756,34 @@ class OBJApp(App):
         self.zoom = min(width, height) * 0.3
         self.redraw()
 
+    def request_redraw(self, delay_ms=20):
+        """Объединить частые события мыши/слайдеров в один кадр рендеринга."""
+        if self._redraw_after_id is None:
+            self._redraw_after_id = self.root.after(delay_ms, self._run_scheduled_redraw)
+
+    def _run_scheduled_redraw(self):
+        self._redraw_after_id = None
+        self.redraw()
+
     def redraw(self):
+        # Прямой redraw отменяет устаревший отложенный кадр.
+        if self._redraw_after_id is not None:
+            try:
+                self.root.after_cancel(self._redraw_after_id)
+            except tk.TclError:
+                pass
+            self._redraw_after_id = None
         canvas = self.canvas
         canvas.delete("all")
         width, height = canvas.winfo_width(), canvas.winfo_height()
         if width < 10 or height < 10:
+            return
+        try:
+            light_position = (self.light_x.get(), self.light_y.get(), self.light_z.get())
+            if not all(math.isfinite(value) for value in light_position):
+                raise ValueError
+        except (tk.TclError, ValueError):
+            self.status.set("Некорректные координаты источника света: введите числа для X, Y и Z.")
             return
         mode, dist = self.mode.get(), self.dist.get()
         rotation = view_matrix(self.yaw, self.pitch)
@@ -682,14 +816,22 @@ class OBJApp(App):
                 if self.backface_enabled.get() else model
             )
 
-        # Важно: Z-буфер получает только отфильтрованные модели. Его реализация
-        # и проверка глубины остаются без изменений.
-        buffer = render_scene(render_models, to_view, width, height,
-                              self.zoom, mode, dist, self.filled.get())
+        # Z-буфер получает только отфильтрованные модели, но нормали для
+        # интерполяции сохранены по полной исходной сетке.
+        # Цвет применяется к выбранному объекту, остальные сохраняют палитру.
+        object_colors = [None] * len(render_models)
+        if 0 <= self.active_index < len(object_colors):
+            object_colors[self.active_index] = self.object_color
+        buffer = render_scene(
+            render_models, to_view, width, height, self.zoom, mode, dist,
+            self.filled.get(), shading=self._render_shading_mode(),
+            light_position=light_position,
+            object_colors=object_colors,
+        )
         self._render_image = tk.PhotoImage(master=self.root, data=buffer.ppm(), format="PPM")
         canvas.create_image(0, 0, anchor="nw", image=self._render_image)
         if self.show_axes.get():
-            # Coordinate axes are an interface overlay, not scene geometry.
+            # Координатные оси — вспомогательная разметка поверх изображения сцены.
             self._draw_axes(to_view, to_screen)
         if self.backface_enabled.get() and self.show_culled_faces.get():
             for face_views in face_views_by_model:
@@ -723,6 +865,10 @@ class OBJApp(App):
             + f"Выбран: {self.poly.name}: V={len(self.poly.vertices)}, F={len(self.poly.faces)}"
             + "\nЦентр: (%.3g, %.3g, %.3g)" % self.poly.center()
             + f"\n{culling_note}"
+            + f"\nЗакраска: {self.shading.get()} · Цвет выбранного объекта: {self.object_color_hex}"
+            + "\nПоложение света: (%.2f, %.2f, %.2f)" % light_position
+            + ("\nТекстуры OBJ пока не поддерживаются: режим показывает базовый цвет."
+               if self._render_shading_mode() == "texture" else "")
             + "\nВектор обзора: (%.3f, %.3f, %.3f)" % view_vector
             + f"\n{source}\nЛКМ — камера; колесо — масштаб.\nФайл → Подобрать вид: показать всю модель."
         )
