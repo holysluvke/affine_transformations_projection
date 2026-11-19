@@ -67,7 +67,7 @@ class Camera:
         return look_at_matrix(self.position, self.direction, self.up)
 
     def projection_matrix(self, aspect):
-        # aspect это ширина/высота кадра
+        # aspect это отношение ширины и высоты кадра
         return perspective_matrix(self.fov, aspect, self.near, self.far)
 
     def to_view(self, point):
@@ -80,7 +80,7 @@ class Camera:
         self.direction = _unit(_sub(target, self.position))
 
     def orbit_around(self, center, azimuth_deg, elevation_deg, distance):
-        """Поставить камеру на сферу вокруг center и повернуть лицом к центру"""
+        """Поставить камеру на сферу вокруг центра и повернуть лицом к центру"""
         if distance <= 0.0:
             raise ValueError("расстояние до центра должно быть положительным")
         az = math.radians(azimuth_deg)
@@ -172,7 +172,7 @@ class RenderResult:
     buffer: ZBuffer
     visible: int = 0  # сколько граней лицевых
     culled: int = 0  # сколько нелицевых
-    face_views: list = field(default_factory=list)  # по моделям пригодится окну
+    face_views: list = field(default_factory=list)
 
 
 def render_camera(models, camera, width, height, filled=True, backface=True):
